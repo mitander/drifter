@@ -1,17 +1,79 @@
 #!/bin/sh
 COMMIT_MSG_FILE=$1
-COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+COMMIT_MSG_HEADER=$(head -n1 "$COMMIT_MSG_FILE")
 
-# Use convention commits: https://www.conventionalcommits.org/en/v1.0.0-beta.2/
-# Basic regex for <type>(<scope>): <subject>
-# This is a simplified regex and might need refinement for all conventional commit rules
-CONVENTIONAL_COMMIT_REGEX="^(feat|fix|build|chore|ci|docs|perf|refactor|revert|style|test)(\(.+\))?!?: .{1,50}"
+# awk script to validate the commit message header
+# The awk program is now a single argument string.
+# Regex is defined inside awk's BEGIN block.
+# In shell strings, to get a literal backslash for awk, you need \\.
+# Awk itself uses \ for regex escapes. So \\( becomes \( in awk's regex.
+AWK_SCRIPT='
+BEGIN {
+    # Regex for Conventional Commits, for awk
+    # Type: (feat|fix|...)
+    # Optional Scope: (\([^)]+\))? -- literal parens, one or more non-) chars, optional
+    # Optional Bang: !?
+    # Colon and Space: :
+    # Subject: [^ \t][^\n\r]* -- Must start with a non-space/tab char, then any non-newline chars
+    pattern = "^(feat|fix|build|chore|ci|docs|perf|refactor|revert|style|test)(\\([^)]+\\))?(!?): [^ \t][^\\n\\r]*$"
 
-if ! echo "$COMMIT_MSG" | grep -Eq "$CONVENTIONAL_COMMIT_REGEX"; then
-    echo "ERROR: Commit message does not follow Conventional Commits format."
+    # Assume failure (exit code 1 for awk)
+    exit_code = 1
+}
+
+# If the input line ($0) matches the pattern
+$0 ~ pattern {
+    exit_code = 0 # Success (exit code 0 for awk)
+}
+
+END {
+    exit exit_code
+}
+'
+
+# Use awk to check the pattern
+# echo "$COMMIT_MSG_HEADER" | awk "$AWK_SCRIPT"
+# The previous line might have issues with how shell interprets $AWK_SCRIPT if it has newlines
+# Let's try piping the script directly for awk -f -
+
+if ! echo "$COMMIT_MSG_HEADER" | awk "$AWK_SCRIPT"; then
+    echo "-------------------------------------------------------------------"
+    echo "ERROR: Invalid commit message format (Primary check failed with awk)."
+    echo "-------------------------------------------------------------------"
+    echo "Your commit message header:"
+    echo "    \"$COMMIT_MSG_HEADER\""
+    echo ""
+    echo "Aborting commit."
+    echo "Please follow the Conventional Commits format: https://www.conventionalcommits.org/"
+    echo "Format: <type>(optional scope)!: <description>"
     echo "Example: feat(parser): add ability to parse arrays"
+    echo "Example: fix!: correct handling of Unicode characters (BREAKING CHANGE)"
     echo "Allowed types: feat, fix, build, chore, ci, docs, perf, refactor, revert, style, test"
+    echo "The description must start with a non-space character after the ': ' and be non-empty."
+    echo "-------------------------------------------------------------------"
     exit 1
 fi
 
+# Separate subject validation for length
+# This sed command is generally robust for extracting subject after ": "
+SUBJECT_CONTENT=$(echo "$COMMIT_MSG_HEADER" | sed -E 's/^(feat|fix|build|chore|ci|docs|perf|refactor|revert|style|test)(\([^)]*\))?(!?): //')
+SUBJECT_LENGTH=$(echo -n "$SUBJECT_CONTENT" | wc -c | awk '{print $1}')
+
+if [ "$SUBJECT_LENGTH" -lt 1 ]; then
+    echo "-------------------------------------------------------------------"
+    echo "ERROR: Commit message subject must not be empty."
+    echo "-------------------------------------------------------------------"
+    exit 1
+fi
+
+if [ "$SUBJECT_LENGTH" -gt 100 ]; then # Max subject length
+    echo "-------------------------------------------------------------------"
+    echo "ERROR: Commit message subject is too long (Max 100 chars)."
+    echo "-------------------------------------------------------------------"
+    echo "Your subject: \"$SUBJECT_CONTENT\" (Length: $SUBJECT_LENGTH)"
+    echo "-------------------------------------------------------------------"
+    exit 1
+fi
+
+echo "Commit message format OK."
 exit 0
