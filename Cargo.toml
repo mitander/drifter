@@ -1,2 +1,3 @@
 [workspace]
-members = ["drifter_core"]
+resolver = "2"
+members = [ "drifter_cli","drifter_core"]
