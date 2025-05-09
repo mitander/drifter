@@ -1,0 +1,17 @@
+#!/bin/sh
+COMMIT_MSG_FILE=$1
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Use convention commits: https://www.conventionalcommits.org/en/v1.0.0-beta.2/
+# Basic regex for <type>(<scope>): <subject>
+# This is a simplified regex and might need refinement for all conventional commit rules
+CONVENTIONAL_COMMIT_REGEX="^(feat|fix|build|chore|ci|docs|perf|refactor|revert|style|test)(\(.+\))?!?: .{1,50}"
+
+if ! echo "$COMMIT_MSG" | grep -Eq "$CONVENTIONAL_COMMIT_REGEX"; then
+    echo "ERROR: Commit message does not follow Conventional Commits format."
+    echo "Example: feat(parser): add ability to parse arrays"
+    echo "Allowed types: feat, fix, build, chore, ci, docs, perf, refactor, revert, style, test"
+    exit 1
+fi
+
+exit 0
