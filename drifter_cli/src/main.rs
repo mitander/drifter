@@ -1,7 +1,6 @@
 use drifter_core::corpus::{Corpus, InMemoryCorpus};
 use drifter_core::executor::{Executor, InProcessExecutor};
 use drifter_core::feedback::{Feedback, UniqueInputFeedback};
-use drifter_core::input::Input;
 use drifter_core::mutator::{FlipSingleByteMutator, Mutator};
 use drifter_core::observer::{NoOpObserver, Observer};
 use drifter_core::oracle::{CrashOracle, Oracle};
@@ -9,6 +8,7 @@ use drifter_core::scheduler::{RandomScheduler, Scheduler};
 
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
+use std::any::Any;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -34,18 +34,22 @@ fn main() -> Result<(), anyhow::Error> {
     let mut noop_observer = NoOpObserver;
     let mut observers_list: Vec<&mut dyn Observer> = vec![&mut noop_observer];
 
-    let initial_seed_data = vec![b'G', b'O', b'O', b'D'];
-    let seed_hash = md5::compute(initial_seed_data.as_bytes());
-    feedback.known_hashes.insert(seed_hash.0);
-    corpus.add(initial_seed_data, Box::new("Initial Seed".to_string()))?;
+    let initial_seed_data_1 = vec![b'G', b'O', b'O', b'D'];
+    let seed_meta_1: Box<dyn Any + Send + Sync> = Box::new("Initial Seed 1".to_string());
+    corpus.add(initial_seed_data_1.clone(), seed_meta_1)?;
+    feedback.add_known_input_hash(&initial_seed_data_1);
+
+    let initial_seed_data_2 = vec![b'S', b'A', b'F', b'E'];
+    let seed_meta_2: Box<dyn Any + Send + Sync> = Box::new("Initial Seed 2".to_string());
+    corpus.add(initial_seed_data_2.clone(), seed_meta_2)?;
+    feedback.add_known_input_hash(&initial_seed_data_2);
 
     feedback.init(&corpus)?;
 
-    println!("Starting fuzz loop with basic Corpus, Scheduler, and Feedback...");
+    println!("Starting fuzz loop with encapsulated Feedback...");
     let start_time = Instant::now();
     let mut executions = 0;
     let mut solutions_found = 0;
-
     let max_iterations = 50000;
 
     for i in 0..max_iterations {
@@ -55,12 +59,16 @@ fn main() -> Result<(), anyhow::Error> {
                 (id, input_ref.clone())
             }
             Err(_e) => {
-                let generated = mutator.mutate(None, &mut rng, Some(&corpus))?;
-                corpus.add(generated.clone(), Box::new("Generated Seed".to_string()))?;
-                feedback
-                    .known_hashes
-                    .insert(md5::compute(generated.as_bytes()).0);
-                (corpus.len() - 1, generated)
+                println!(
+                    "Warning: Scheduler failed, possibly empty corpus after initial seeds processed? This shouldn't happen with current logic."
+                );
+                let emergency_seed = vec![0u8];
+                feedback.add_known_input_hash(&emergency_seed);
+                corpus.add(
+                    emergency_seed.clone(),
+                    Box::new("Emergency Seed".to_string()),
+                )?;
+                (corpus.len() - 1, emergency_seed)
             }
         };
 
@@ -78,19 +86,22 @@ fn main() -> Result<(), anyhow::Error> {
         }
 
         let mut is_solution = false;
-        if feedback.is_interesting(&mutated_input, &observers_data_map, &corpus)? {
-            feedback.report_interesting(mutated_input.clone(), &observers_data_map, &mut corpus)?;
-        }
+        let _was_added_by_feedback = feedback.process_execution(
+            &mutated_input,
+            mutated_input.clone(),
+            &observers_data_map,
+            &mut corpus,
+        )?;
 
         if let Some(bug_report) = oracle.examine(&mutated_input, &status, None) {
             println!("\n!!! BUG FOUND (Execution {}) !!!", executions);
             println!("  Input: {:?}", bug_report.input);
             println!("  Description: {}", bug_report.description);
             println!("  Hash: {}", bug_report.hash);
-            corpus.add(
-                bug_report.input.clone(),
-                Box::new(format!("Crash: {}", bug_report.description)),
-            )?;
+            let bug_meta: Box<dyn Any + Send + Sync> =
+                Box::new(format!("Crash: {}", bug_report.description));
+            corpus.add(bug_report.input.clone(), bug_meta)?;
+            feedback.add_known_input_hash(&bug_report.input);
             is_solution = true;
             solutions_found += 1;
         }
@@ -104,7 +115,11 @@ fn main() -> Result<(), anyhow::Error> {
 
         if i % (max_iterations / 100) == 0 && i > 0 {
             let elapsed = start_time.elapsed().as_secs_f32();
-            let exec_per_sec = executions as f32 / elapsed;
+            let exec_per_sec = if elapsed > 0.0 {
+                executions as f32 / elapsed
+            } else {
+                0.0
+            };
             print!(
                 "\rIter: {}/{}, Corpus: {}, Solutions: {}, Execs/sec: {:.2}",
                 i,

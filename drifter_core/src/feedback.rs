@@ -21,17 +21,18 @@ pub trait Feedback<I: Input, C: Corpus<I>>: Send + Sync {
         observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
         corpus: &C,
     ) -> Result<bool, FeedbackError>;
-    fn report_interesting(
+    fn process_execution(
         &mut self,
-        input: I,
+        executed_input_ref: &I,
+        input_to_potentially_add: I,
         observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
         corpus: &mut C,
-    ) -> Result<(), FeedbackError>;
+    ) -> Result<bool, FeedbackError>;
 }
 
 #[derive(Default)]
 pub struct UniqueInputFeedback {
-    pub known_hashes: HashSet<[u8; 16]>,
+    known_hashes: HashSet<[u8; 16]>,
 }
 
 impl UniqueInputFeedback {
@@ -40,6 +41,11 @@ impl UniqueInputFeedback {
             known_hashes: HashSet::new(),
         }
     }
+
+    pub fn add_known_input_hash(&mut self, input: &impl Input) {
+        let hash = md5::compute(input.as_bytes());
+        self.known_hashes.insert(hash.0);
+    }
 }
 
 impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
@@ -47,7 +53,17 @@ impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
         "UniqueInputFeedback"
     }
 
-    fn init(&mut self, _corpus: &C) -> Result<(), FeedbackError> {
+    fn init(&mut self, _: &C) -> Result<(), FeedbackError> {
+        // If we want init to populate known_hashes from an existing corpus:
+        // This assumes corpus can be iterated. Let's keep it simple for now
+        // and assume seeding happens externally via `add_known_input_hash` or by
+        // processing initial seeds through `process_execution`.
+        // For example:
+        // for i in 0..corpus.len() {
+        //     if let Some((input, _)) = corpus.get(i) {
+        //         self.add_known_input_hash(input);
+        //     }
+        // }
         Ok(())
     }
 
@@ -61,18 +77,22 @@ impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
         Ok(!self.known_hashes.contains(&hash.0))
     }
 
-    fn report_interesting(
+    fn process_execution(
         &mut self,
-        input: I,
+        executed_input_ref: &I,
+        input_to_potentially_add: I,
         _observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
         corpus: &mut C,
-    ) -> Result<(), FeedbackError> {
-        let hash = md5::compute(input.as_bytes());
+    ) -> Result<bool, FeedbackError> {
+        let hash = md5::compute(executed_input_ref.as_bytes());
         if self.known_hashes.insert(hash.0) {
-            let metadata: Box<dyn Any + Send + Sync> = Box::new(hash.0);
-            corpus.add(input, metadata)?;
+            let metadata: Box<dyn Any + Send + Sync> =
+                Box::new(format!("Unique hash: {:x}", md5::Digest(hash.0)));
+            corpus.add(input_to_potentially_add, metadata)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(())
     }
 }
 
@@ -95,15 +115,21 @@ mod tests {
                 .is_interesting(&input1, &observers_data, &corpus)
                 .unwrap()
         );
-        feedback
-            .report_interesting(input1.clone(), &observers_data, &mut corpus)
+        let added1 = feedback
+            .process_execution(&input1, input1.clone(), &observers_data, &mut corpus)
             .unwrap();
+        assert!(added1);
         assert_eq!(corpus.len(), 1);
         assert!(
             !feedback
                 .is_interesting(&input1, &observers_data, &corpus)
                 .unwrap()
         );
+        let added1_again = feedback
+            .process_execution(&input1, input1.clone(), &observers_data, &mut corpus)
+            .unwrap();
+        assert!(!added1_again);
+        assert_eq!(corpus.len(), 1);
 
         let input2: Vec<u8> = vec![4, 5, 6];
         assert!(
@@ -111,15 +137,25 @@ mod tests {
                 .is_interesting(&input2, &observers_data, &corpus)
                 .unwrap()
         );
-        feedback
-            .report_interesting(input2.clone(), &observers_data, &mut corpus)
+        let added2 = feedback
+            .process_execution(&input2, input2.clone(), &observers_data, &mut corpus)
             .unwrap();
+        assert!(added2);
         assert_eq!(corpus.len(), 2);
+    }
 
-        let initial_corpus_len = corpus.len();
-        feedback
-            .report_interesting(input1.clone(), &observers_data, &mut corpus)
-            .unwrap();
-        assert_eq!(corpus.len(), initial_corpus_len);
+    #[test]
+    fn unique_input_feedback_add_known() {
+        let mut feedback = UniqueInputFeedback::new();
+        let input1: Vec<u8> = vec![1, 2, 3];
+        let observers_data = HashMap::new();
+        let corpus: InMemoryCorpus<Vec<u8>> = InMemoryCorpus::new();
+
+        feedback.add_known_input_hash(&input1);
+        assert!(
+            !feedback
+                .is_interesting(&input1, &observers_data, &corpus)
+                .unwrap()
+        );
     }
 }
