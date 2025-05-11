@@ -12,8 +12,12 @@ pub enum SchedulerError {
     CorpusInteractionError(#[from] crate::corpus::CorpusError),
 }
 
-pub trait Scheduler<I: Input, C: Corpus<I>>: Send + Sync {
-    fn next(&mut self, corpus: &C, rng: &mut dyn RngCore) -> Result<usize, SchedulerError>;
+pub trait Scheduler<I: Input>: Send + Sync {
+    fn next(
+        &mut self,
+        corpus: &dyn Corpus<I>,
+        rng: &mut dyn RngCore,
+    ) -> Result<usize, SchedulerError>;
     fn report_feedback(&mut self, input_id: usize, feedback_value: &dyn Any, is_solution: bool);
 }
 
@@ -26,8 +30,12 @@ impl RandomScheduler {
     }
 }
 
-impl<I: Input, C: Corpus<I>> Scheduler<I, C> for RandomScheduler {
-    fn next(&mut self, corpus: &C, rng: &mut dyn RngCore) -> Result<usize, SchedulerError> {
+impl<I: Input> Scheduler<I> for RandomScheduler {
+    fn next(
+        &mut self,
+        corpus: &dyn Corpus<I>,
+        rng: &mut dyn RngCore,
+    ) -> Result<usize, SchedulerError> {
         if corpus.is_empty() {
             return Err(SchedulerError::CorpusEmpty);
         }
@@ -44,7 +52,7 @@ impl<I: Input, C: Corpus<I>> Scheduler<I, C> for RandomScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::corpus::{CorpusError, InMemoryCorpus};
+    use crate::corpus::{Corpus, InMemoryCorpus};
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
     use std::any::Any;
@@ -61,10 +69,10 @@ mod tests {
             Ok(_) => panic!("Expected error for empty corpus, got Ok"),
         }
 
-        let meta1: Box<dyn Any + Send + Sync> = Box::new(()); // Created new
+        let meta1: Box<dyn Any + Send + Sync> = Box::new(());
         corpus.add(vec![1], meta1).unwrap();
 
-        let meta2: Box<dyn Any + Send + Sync> = Box::new(()); // Created new
+        let meta2: Box<dyn Any + Send + Sync> = Box::new(());
         corpus.add(vec![2], meta2).unwrap();
 
         let mut selected_count = 0;
@@ -79,35 +87,6 @@ mod tests {
     #[test]
     fn random_scheduler_report_feedback_is_noop() {
         let mut scheduler: RandomScheduler = RandomScheduler::new();
-
-        struct TestContextCorpus;
-        impl<I: Input> Corpus<I> for TestContextCorpus {
-            fn add(
-                &mut self,
-                _input: I,
-                _metadata: Box<dyn Any + Send + Sync>,
-            ) -> Result<usize, CorpusError> {
-                Ok(0)
-            }
-            fn get(&self, _id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
-                None
-            }
-            fn random_select(
-                &self,
-                _rng: &mut dyn RngCore,
-            ) -> Option<(usize, &I, &Box<dyn Any + Send + Sync>)> {
-                None
-            }
-            fn len(&self) -> usize {
-                0
-            }
-        }
-
-        <RandomScheduler as Scheduler<Vec<u8>, TestContextCorpus>>::report_feedback(
-            &mut scheduler,
-            0,
-            &(),
-            false,
-        );
+        <RandomScheduler as Scheduler<Vec<u8>>>::report_feedback(&mut scheduler, 0, &(), false);
     }
 }

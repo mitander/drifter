@@ -12,22 +12,24 @@ pub enum FeedbackError {
     CorpusInteractionError(#[from] crate::corpus::CorpusError),
 }
 
-pub trait Feedback<I: Input, C: Corpus<I>>: Send + Sync {
+pub trait Feedback<I: Input>: Send + Sync {
     fn name(&self) -> &'static str;
-    fn init(&mut self, corpus: &C) -> Result<(), FeedbackError>;
+    fn init(&mut self, corpus: &dyn Corpus<I>) -> Result<(), FeedbackError>;
     fn is_interesting(
         &mut self,
         input: &I,
         observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
-        corpus: &C,
+        corpus: &dyn Corpus<I>,
     ) -> Result<bool, FeedbackError>;
     fn process_execution(
         &mut self,
         executed_input_ref: &I,
         input_to_potentially_add: I,
         observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
-        corpus: &mut C,
+        corpus: &mut dyn Corpus<I>,
     ) -> Result<bool, FeedbackError>;
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 #[derive(Default)]
@@ -48,16 +50,16 @@ impl UniqueInputFeedback {
     }
 }
 
-impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
+impl<I: Input> Feedback<I> for UniqueInputFeedback {
     fn name(&self) -> &'static str {
         "UniqueInputFeedback"
     }
 
-    fn init(&mut self, _: &C) -> Result<(), FeedbackError> {
+    fn init(&mut self, _corpus: &dyn Corpus<I>) -> Result<(), FeedbackError> {
         // If we want init to populate known_hashes from an existing corpus:
         // This assumes corpus can be iterated. Let's keep it simple for now
         // and assume seeding happens externally via `add_known_input_hash` or by
-        // processing initial seeds through `process_execution`.
+        // processing initial seeds through `process_execution` or `add_known_input_hash`.
         // For example:
         // for i in 0..corpus.len() {
         //     if let Some((input, _)) = corpus.get(i) {
@@ -71,7 +73,7 @@ impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
         &mut self,
         input: &I,
         _observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
-        _corpus: &C,
+        _corpus: &dyn Corpus<I>,
     ) -> Result<bool, FeedbackError> {
         let hash = md5::compute(input.as_bytes());
         Ok(!self.known_hashes.contains(&hash.0))
@@ -82,7 +84,7 @@ impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
         executed_input_ref: &I,
         input_to_potentially_add: I,
         _observers_data: &HashMap<&'static str, Option<Vec<u8>>>,
-        corpus: &mut C,
+        corpus: &mut dyn Corpus<I>,
     ) -> Result<bool, FeedbackError> {
         let hash = md5::compute(executed_input_ref.as_bytes());
         if self.known_hashes.insert(hash.0) {
@@ -93,6 +95,14 @@ impl<I: Input, C: Corpus<I>> Feedback<I, C> for UniqueInputFeedback {
         } else {
             Ok(false)
         }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

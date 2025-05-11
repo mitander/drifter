@@ -1,3 +1,4 @@
+pub mod config;
 pub mod corpus;
 pub mod executor;
 pub mod feedback;
@@ -7,6 +8,7 @@ pub mod observer;
 pub mod oracle;
 pub mod scheduler;
 
+pub use config::DrifterConfig;
 pub use corpus::{Corpus, CorpusError, InMemoryCorpus};
 pub use executor::{ExecutionStatus, Executor, InProcessExecutor};
 pub use feedback::{Feedback, FeedbackError, UniqueInputFeedback};
