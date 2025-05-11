@@ -65,7 +65,7 @@ mod tests {
 
         match scheduler.next(&corpus, &mut rng) {
             Err(SchedulerError::CorpusEmpty) => {}
-            Err(e) => panic!("Expected CorpusEmpty error, got {:?}", e),
+            Err(e) => panic!("Expected CorpusEmpty error, got {e:?}"),
             Ok(_) => panic!("Expected error for empty corpus, got Ok"),
         }
 

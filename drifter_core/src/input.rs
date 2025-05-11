@@ -1,6 +1,7 @@
 pub trait Input: Clone + Send + Sync + std::fmt::Debug + 'static {
     fn as_bytes(&self) -> &[u8];
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
 }
 
 impl Input for Vec<u8> {
@@ -9,6 +10,9 @@ impl Input for Vec<u8> {
     }
     fn len(&self) -> usize {
         self.len()
+    }
+    fn is_empty(&self) -> bool {
+        self.is_empty()
     }
 }
 

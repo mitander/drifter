@@ -46,7 +46,7 @@ where
         for obs in observers.iter_mut() {
             if let Err(e) = obs.pre_exec() {
                 let error_msg = format!("Observer '{}' pre_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {}", error_msg);
+                eprintln!("ERROR: {error_msg}");
                 return ExecutionStatus::ObserverError(error_msg);
             }
         }
@@ -73,7 +73,7 @@ where
         for obs in observers.iter_mut() {
             if let Err(e) = obs.post_exec(&execution_status, None::<&dyn Any>) {
                 let error_msg = format!("Observer '{}' post_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {}", error_msg);
+                eprintln!("ERROR: {error_msg}");
                 if post_exec_error.is_none() {
                     post_exec_error = Some(error_msg);
                 }
@@ -124,10 +124,9 @@ impl CommandExecutor {
                     if start_time.elapsed() > timeout {
                         eprintln!("Target timed out, killing...");
                         if let Err(e) = child.kill() {
-                            eprintln!("Failed to kill child process: {}", e);
+                            eprintln!("Failed to kill child process: {e}");
                             return Err(ExecutionStatus::Other(format!(
-                                "Failed to kill timed-out process: {}",
-                                e
+                                "Failed to kill timed-out process: {e}",
                             )));
                         }
                         return Err(ExecutionStatus::Timeout);
@@ -135,10 +134,9 @@ impl CommandExecutor {
                     std::thread::sleep(Duration::from_millis(50)); // Adjust poll interval
                 }
                 Err(e) => {
-                    eprintln!("Error waiting for child process: {}", e);
+                    eprintln!("Error waiting for child process: {e}");
                     return Err(ExecutionStatus::Other(format!(
-                        "Error waiting for child: {}",
-                        e
+                        "Error waiting for child: {e}",
                     )));
                 }
             }
@@ -159,7 +157,7 @@ impl<I: Input> Executor<I> for CommandExecutor {
         for obs in observers.iter_mut() {
             if let Err(e) = obs.pre_exec() {
                 let error_msg = format!("Observer '{}' pre_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {}", error_msg);
+                eprintln!("ERROR: {error_msg}");
                 return ExecutionStatus::ObserverError(error_msg);
             }
         }
@@ -183,10 +181,7 @@ impl<I: Input> Executor<I> for CommandExecutor {
                 let named_temp_file = match tempfile::NamedTempFile::new() {
                     Ok(f) => f,
                     Err(e) => {
-                        return ExecutionStatus::Other(format!(
-                            "Failed to create temp file: {}",
-                            e
-                        ));
+                        return ExecutionStatus::Other(format!("Failed to create temp file: {e}",));
                     }
                 };
                 if let Err(e) = File::create(named_temp_file.path())
@@ -230,7 +225,7 @@ impl<I: Input> Executor<I> for CommandExecutor {
             Err(e) => {
                 let error_msg =
                     format!("Failed to spawn command '{:?}': {}", self.config.command, e);
-                eprintln!("ERROR: {}", error_msg);
+                eprintln!("ERROR: {error_msg}");
                 let mut status_on_fail = ExecutionStatus::Other(error_msg.clone());
                 for obs in observers.iter_mut() {
                     if let Err(e_obs) = obs.post_exec(&status_on_fail, None::<&dyn Any>) {
@@ -256,10 +251,10 @@ impl<I: Input> Executor<I> for CommandExecutor {
         if let InputDelivery::StdIn = self.config.input_delivery {
             if let Some(mut child_stdin) = child_process.stdin.take() {
                 if let Err(e) = child_stdin.write_all(input.as_bytes()) {
-                    eprintln!("Error writing to child stdin: {}. Killing child.", e);
+                    eprintln!("Error writing to child stdin: {e}. Killing child.");
                     let _ = child_process.kill();
                     let _ = child_process.wait();
-                    return ExecutionStatus::Other(format!("Failed to write to stdin: {}", e));
+                    return ExecutionStatus::Other(format!("Failed to write to stdin: {e}"));
                 }
             } else {
                 return ExecutionStatus::Other(
@@ -297,13 +292,13 @@ impl<I: Input> Executor<I> for CommandExecutor {
                     ExecutionStatus::Ok
                 } else {
                     let desc = if let Some(code) = status.code() {
-                        format!("Exited with code {}", code)
+                        format!("Exited with code {code}")
                     } else if cfg!(unix) {
                         #[cfg(unix)]
                         {
                             use std::os::unix::process::ExitStatusExt;
                             if let Some(signal) = status.signal() {
-                                format!("Terminated by signal {}", signal)
+                                format!("Terminated by signal {signal}")
                             } else {
                                 "Exited abnormally".to_string()
                             }
@@ -329,7 +324,7 @@ impl<I: Input> Executor<I> for CommandExecutor {
         for obs in observers.iter_mut() {
             if let Err(e) = obs.post_exec(&overall_status, Some(&process_output_data as &dyn Any)) {
                 let error_msg = format!("Observer '{}' post_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {}", error_msg);
+                eprintln!("ERROR: {error_msg}");
                 if post_exec_error_msg.is_none() {
                     post_exec_error_msg = Some(error_msg);
                 }
@@ -384,7 +379,7 @@ mod in_process_executor_tests {
         let status = executor.execute_sync(&crashing_input, &mut observers);
         match status {
             ExecutionStatus::Crash(msg) => assert!(msg.contains("Boom!")),
-            _ => panic!("Expected a crash, got {:?}", status),
+            _ => panic!("Expected a crash, got {status:?}"),
         }
     }
 
@@ -466,7 +461,7 @@ mod in_process_executor_tests {
                 assert!(msg.contains("pre_exec intentional failure"));
                 assert_eq!(failing_observer.fail_count.load(Ordering::SeqCst), 1);
             }
-            _ => panic!("Expected ObserverError, got {:?}", status),
+            _ => panic!("Expected ObserverError, got {status:?}"),
         }
     }
 
@@ -486,7 +481,7 @@ mod in_process_executor_tests {
                 assert!(msg.contains("post_exec intentional failure"));
                 assert_eq!(failing_observer.fail_count.load(Ordering::SeqCst), 1);
             }
-            _ => panic!("Expected ObserverError, got {:?}", status),
+            _ => panic!("Expected ObserverError, got {status:?}"),
         }
     }
 
@@ -506,7 +501,7 @@ mod in_process_executor_tests {
                 assert!(msg.contains("Boom!"));
                 assert_eq!(failing_observer.fail_count.load(Ordering::SeqCst), 1);
             }
-            _ => panic!("Expected Crash, got {:?}", status),
+            _ => panic!("Expected Crash, got {status:?}"),
         }
     }
 }
@@ -525,7 +520,7 @@ mod command_executor_tests {
     fn cmd_exec_successful_run_stdin() {
         let target_path = get_test_target_path("test_target_ok.sh");
         if !target_path.exists() {
-            panic!("Test target missing: {:?}", target_path);
+            panic!("Test target missing: {target_path:?}");
         }
 
         let config = CommandExecutorConfig {
@@ -547,7 +542,7 @@ mod command_executor_tests {
     fn cmd_exec_crash_detection() {
         let target_path = get_test_target_path("test_target_crash.sh");
         if !target_path.exists() {
-            panic!("Test target missing: {:?}", target_path);
+            panic!("Test target missing: {target_path:?}");
         }
 
         let config = CommandExecutorConfig {
@@ -567,11 +562,10 @@ mod command_executor_tests {
                 // On Unix, exit 139 means killed by signal 11 (SIGSEGV)
                 assert!(
                     desc.contains("code 139") || desc.contains("signal 11"),
-                    "Unexpected crash desc: {}",
-                    desc
+                    "Unexpected crash desc: {desc}",
                 );
             }
-            _ => panic!("Expected Crash status, got {:?}", status),
+            _ => panic!("Expected Crash status, got {status:?}"),
         }
     }
 
@@ -579,7 +573,7 @@ mod command_executor_tests {
     fn cmd_exec_timeout() {
         let target_path = get_test_target_path("test_target_timeout.sh");
         if !target_path.exists() {
-            panic!("Test target missing: {:?}", target_path);
+            panic!("Test target missing: {target_path:?}");
         }
 
         let config = CommandExecutorConfig {
@@ -601,7 +595,7 @@ mod command_executor_tests {
     fn cmd_exec_input_via_file() {
         let target_path = get_test_target_path("test_target_file_check.sh");
         if !target_path.exists() {
-            panic!("Test target missing: {:?}", target_path);
+            panic!("Test target missing: {target_path:?}");
         }
 
         let config = CommandExecutorConfig {
@@ -629,14 +623,10 @@ mod command_executor_tests {
             ExecutionStatus::Crash(desc) => {
                 assert!(
                     desc.contains("code 1"),
-                    "Expected crash with code 1, got: {}",
-                    desc
+                    "Expected crash with code 1, got: {desc}",
                 );
             }
-            _ => panic!(
-                "Expected Crash status for CRASHFILE, got {:?}",
-                status_crash
-            ),
+            _ => panic!("Expected Crash status for CRASHFILE, got {status_crash:?}",),
         }
     }
 
@@ -661,10 +651,7 @@ mod command_executor_tests {
                         || msg.contains("No such file or directory")
                 );
             }
-            _ => panic!(
-                "Expected Other status for invalid command, got {:?}",
-                status
-            ),
+            _ => panic!("Expected Other status for invalid command, got {status:?}",),
         }
     }
 }

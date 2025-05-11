@@ -43,10 +43,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     let mut config = match cli.config_file {
         Some(config_path) => {
-            println!(
-                "Loading configuration from specified path: {:?}",
-                config_path
-            );
+            println!("Loading configuration from specified path: {config_path:?}",);
             DrifterConfig::load_from_file(&config_path)?
         }
         None => {
@@ -54,8 +51,7 @@ fn main() -> Result<(), anyhow::Error> {
             let default_config_path = PathBuf::from("config.toml");
             if default_config_path.exists() {
                 println!(
-                    "No config file specified via CLI, loading default: {:?}",
-                    default_config_path
+                    "No config file specified via CLI, loading default: {default_config_path:?}",
                 );
                 DrifterConfig::load_from_file(&default_config_path)?
             } else {
@@ -95,7 +91,7 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    println!("Effective configuration: {:#?}", config);
+    println!("Effective configuration: {config:#?}");
 
     let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
 
@@ -141,8 +137,7 @@ fn main() -> Result<(), anyhow::Error> {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("on_disk_path missing for OnDiskCorpus"))?;
             println!(
-                "Using OnDiskCorpus (Not yet implemented, falling back to InMemory). Path: {:?}",
-                path
+                "Using OnDiskCorpus (Not yet implemented, falling back to InMemory). Path: {path:?}",
             );
             Box::new(InMemoryCorpus::<Vec<u8>>::new())
         }
@@ -154,7 +149,7 @@ fn main() -> Result<(), anyhow::Error> {
             for path in seed_paths {
                 if path.is_file() {
                     let data = std::fs::read(path)?;
-                    let meta: Box<dyn Any + Send + Sync> = Box::new(format!("Seed: {:?}", path));
+                    let meta: Box<dyn Any + Send + Sync> = Box::new(format!("Seed: {path:?}"));
                     corpus.add(data, meta)?;
                 } else if path.is_dir() {
                     for entry in std::fs::read_dir(path)? {
@@ -163,7 +158,7 @@ fn main() -> Result<(), anyhow::Error> {
                         if file_path.is_file() {
                             let data = std::fs::read(&file_path)?;
                             let meta: Box<dyn Any + Send + Sync> =
-                                Box::new(format!("Seed: {:?}", file_path));
+                                Box::new(format!("Seed: {file_path:?}"));
                             corpus.add(data, meta)?;
                         }
                     }
@@ -264,7 +259,7 @@ fn main() -> Result<(), anyhow::Error> {
         )?;
 
         if let Some(bug_report) = oracle.as_ref().examine(&mutated_input, &status, None) {
-            println!("\n!!! BUG FOUND (Execution {}) !!!", executions);
+            println!("\n!!! BUG FOUND (Execution {executions}) !!!");
             println!("  Input: {:?}", bug_report.input);
             println!("  Description: {}", bug_report.description);
             println!("  Hash: {}", bug_report.hash);
@@ -306,7 +301,7 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
     let elapsed_total = start_time.elapsed();
-    println!("\nFuzz loop finished in {:.2?}.", elapsed_total);
+    println!("\nFuzz loop finished in {elapsed_total:.2?}.");
     println!(
         "Total Executions: {}, Corpus Size: {}, Solutions Found: {}",
         executions,
