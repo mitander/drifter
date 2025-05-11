@@ -1,4 +1,6 @@
-use drifter_core::config::{DrifterConfig, ExecutorType as ConfigExecutorType, default_iterations};
+use drifter_core::config::{
+    CorpusType, DrifterConfig, ExecutorType as ConfigExecutorType, default_iterations,
+};
 use drifter_core::corpus::{Corpus, InMemoryCorpus};
 use drifter_core::executor::{
     CommandExecutor, CommandExecutorConfig, Executor, InProcessExecutor,
@@ -123,12 +125,8 @@ fn main() -> Result<(), anyhow::Error> {
 
     let oracle: Box<dyn Oracle<Vec<u8>>> = Box::new(CrashOracle);
 
-    let mut corpus: Box<dyn Corpus<Vec<u8>>> = match config
-        .corpus
-        .as_ref()
-        .map(|c| c.corpus_type.as_str())
-    {
-        Some("OnDisk") => {
+    let mut corpus: Box<dyn Corpus<Vec<u8>>> = match config.corpus.as_ref().unwrap().corpus_type {
+        CorpusType::OnDisk => {
             let path = config
                 .corpus
                 .as_ref()

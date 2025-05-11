@@ -44,18 +44,34 @@ pub struct ExecutorConfig {
     pub command_settings: Option<CommandExecutorSettings>,
 }
 
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorpusType {
+    InMemory,
+    OnDisk,
+}
+
+impl CorpusType {
+    pub fn to_string(&self) -> &str {
+        match self {
+            CorpusType::InMemory => "InMemory",
+            CorpusType::OnDisk => "OnDisk",
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub struct CorpusConfig {
     #[serde(default = "default_corpus_type")]
-    pub corpus_type: String,
+    pub corpus_type: CorpusType,
     pub initial_seed_paths: Option<Vec<PathBuf>>,
     pub on_disk_path: Option<PathBuf>,
 }
 
-fn default_corpus_type() -> String {
-    "InMemory".to_string()
+fn default_corpus_type() -> CorpusType {
+    CorpusType::InMemory
 }
 
 #[derive(Deserialize, Debug, Clone)]
