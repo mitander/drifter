@@ -1,7 +1,7 @@
 use drifter_core::config::{
     CorpusType, DrifterConfig, ExecutorType as ConfigExecutorType, default_iterations,
 };
-use drifter_core::corpus::{Corpus, InMemoryCorpus};
+use drifter_core::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus};
 use drifter_core::executor::{
     CommandExecutor, CommandExecutorConfig, Executor, InProcessExecutor,
     InputDelivery as CoreInputDelivery,
@@ -125,8 +125,9 @@ fn main() -> Result<(), anyhow::Error> {
 
     let oracle: Box<dyn Oracle<Vec<u8>>> = Box::new(CrashOracle);
 
-    let mut corpus: Box<dyn Corpus<Vec<u8>>> = match config.corpus.as_ref().unwrap().corpus_type {
-        CorpusType::OnDisk => {
+    let mut corpus: Box<dyn Corpus<Vec<u8>>> = match config.corpus.as_ref().map(|c| &c.corpus_type)
+    {
+        Some(CorpusType::OnDisk) => {
             let path = config
                 .corpus
                 .as_ref()
@@ -134,12 +135,13 @@ fn main() -> Result<(), anyhow::Error> {
                 .on_disk_path
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("on_disk_path missing for OnDiskCorpus"))?;
-            println!(
-                "Using OnDiskCorpus (Not yet implemented, falling back to InMemory). Path: {path:?}",
-            );
+            println!("Using OnDiskCorpus at path: {path:?}");
+            Box::new(OnDiskCorpus::<Vec<u8>>::new(path)?)
+        }
+        _ => {
+            println!("Using InMemoryCorpus.");
             Box::new(InMemoryCorpus::<Vec<u8>>::new())
         }
-        _ => Box::new(InMemoryCorpus::<Vec<u8>>::new()),
     };
 
     if let Some(corpus_conf) = &config.corpus {
@@ -206,31 +208,39 @@ fn main() -> Result<(), anyhow::Error> {
     let mut solutions_found = 0;
 
     for i in 0..max_iterations {
-        let (base_input_id, base_input_to_mutate) =
-            match scheduler.as_mut().next(corpus.as_ref(), &mut rng) {
-                Ok(id) => {
-                    let (input_ref, _meta_ref) =
-                        corpus.get(id).expect("Scheduler returned invalid ID");
-                    (id, input_ref.clone())
+        let (base_input_id, base_input_to_mutate) = match scheduler
+            .as_mut()
+            .next(corpus.as_ref(), &mut rng)
+        {
+            Ok(id) => {
+                let (input_ref, _meta_ref) =
+                        corpus.get(id).expect("Scheduler returned valid ID but corpus.get failed. This indicates an issue with corpus.get for the current corpus type or a logic error.");
+                (id, input_ref.clone())
+            }
+            Err(scheduler_error) => {
+                eprintln!(
+                    "\nNote: scheduler.next() failed (Error: {:?}, Corpus len: {}). Attempting to generate a new seed input.",
+                    scheduler_error,
+                    corpus.len()
+                );
+
+                let generated_input = mutator.mutate(None, &mut rng, Some(corpus.as_ref()))?; // Generate from scratch
+
+                let meta: Box<dyn Any + Send + Sync> =
+                    Box::new("Generated-During-Loop".to_string());
+                let new_id = corpus.add(generated_input.clone(), meta)?;
+
+                if let Some(uif) = feedback_processor
+                    .as_mut()
+                    .as_any_mut()
+                    .downcast_mut::<UniqueInputFeedback>()
+                {
+                    uif.add_known_input_hash(&generated_input);
                 }
-                Err(_e) => {
-                    if corpus.is_empty() {
-                        break;
-                    }
-                    let generated = mutator.mutate(None, &mut rng, Some(corpus.as_ref()))?;
-                    let meta: Box<dyn Any + Send + Sync> =
-                        Box::new("Emergency Generated Seed".to_string());
-                    let new_id = corpus.add(generated.clone(), meta)?;
-                    if let Some(uif) = feedback_processor
-                        .as_mut()
-                        .as_any_mut()
-                        .downcast_mut::<UniqueInputFeedback>()
-                    {
-                        uif.add_known_input_hash(&generated);
-                    }
-                    (new_id, generated)
-                }
-            };
+
+                (new_id, generated_input)
+            }
+        };
 
         let mutated_input =
             mutator.mutate(Some(&base_input_to_mutate), &mut rng, Some(corpus.as_ref()))?;

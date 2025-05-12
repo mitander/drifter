@@ -9,7 +9,7 @@ pub mod oracle;
 pub mod scheduler;
 
 pub use config::DrifterConfig;
-pub use corpus::{Corpus, CorpusError, InMemoryCorpus};
+pub use corpus::{Corpus, CorpusError, InMemoryCorpus, OnDiskCorpus};
 pub use executor::{ExecutionStatus, Executor, InProcessExecutor};
 pub use feedback::{Feedback, FeedbackError, UniqueInputFeedback};
 pub use input::Input;
