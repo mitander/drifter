@@ -1,61 +1,88 @@
 use crate::input::Input;
+use bincode::{
+    self, config as bincode_config,
+    de::Decode,
+    enc::Encode,
+    error::{DecodeError, EncodeError},
+};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CorpusError {
-    #[error("Input ID {0} not found in corpus")]
+    #[error("Input ID {0} not found in corpus or index")]
     NotFound(usize),
     #[error("Corpus is empty, cannot select an input")]
     Empty,
-    #[error("Corpus I/O error: {0}")] // New variant
+    #[error("Corpus I/O error: {0}")]
     IoError(String),
-    // TODO:
-    // #[error("Serialization error: {0}")]
-    // SerializationError(String),
-    // #[error("Deserialization error: {0}")]
-    // DeserializationError(String),
+    #[error("Serialization error: {0}")]
+    SerializationError(String),
+    #[error("Deserialization error: {0}")]
+    DeserializationError(String),
+    #[error("Input deserialization error: {0}")]
+    InputDeserializationError(String),
+}
+
+impl From<std::io::Error> for CorpusError {
+    fn from(err: std::io::Error) -> Self {
+        CorpusError::IoError(err.to_string())
+    }
+}
+impl From<serde_json::Error> for CorpusError {
+    fn from(err: serde_json::Error) -> Self {
+        CorpusError::DeserializationError(format!("JSON error: {}", err))
+    }
+}
+impl From<EncodeError> for CorpusError {
+    fn from(err: EncodeError) -> Self {
+        CorpusError::SerializationError(format!("Bincode EncodeError: {}", err))
+    }
+}
+impl From<DecodeError> for CorpusError {
+    fn from(err: DecodeError) -> Self {
+        CorpusError::DeserializationError(format!("Bincode DecodeError: {}", err))
+    }
 }
 
 pub trait Corpus<I: Input>: Send + Sync {
     fn add(&mut self, input: I, metadata: Box<dyn Any + Send + Sync>)
     -> Result<usize, CorpusError>;
-    fn get(&self, id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)>;
+    fn get(&mut self, id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)>;
     fn random_select(
-        &self,
+        &mut self,
         rng: &mut dyn RngCore,
     ) -> Option<(usize, &I, &Box<dyn Any + Send + Sync>)>;
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    fn load_initial_seeds(&mut self, seed_paths: &[PathBuf]) -> Result<usize, CorpusError>;
 }
 
+#[derive(Default)]
 pub struct InMemoryCorpus<I: Input> {
     entries: Vec<(I, Box<dyn Any + Send + Sync>)>,
+    _marker: PhantomData<I>,
 }
 
 impl<I: Input> InMemoryCorpus<I> {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            _marker: PhantomData,
         }
     }
 }
 
-impl<I: Input> Default for InMemoryCorpus<I> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<I: Input> Corpus<I> for InMemoryCorpus<I> {
+impl<I: Input + From<Vec<u8>>> Corpus<I> for InMemoryCorpus<I> {
     fn add(
         &mut self,
         input: I,
@@ -66,12 +93,12 @@ impl<I: Input> Corpus<I> for InMemoryCorpus<I> {
         Ok(id)
     }
 
-    fn get(&self, id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
+    fn get(&mut self, id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
         self.entries.get(id).map(|(inp, meta)| (inp, meta))
     }
 
     fn random_select(
-        &self,
+        &mut self,
         rng: &mut dyn RngCore,
     ) -> Option<(usize, &I, &Box<dyn Any + Send + Sync>)> {
         if self.is_empty() {
@@ -84,70 +111,133 @@ impl<I: Input> Corpus<I> for InMemoryCorpus<I> {
     fn len(&self) -> usize {
         self.entries.len()
     }
+
+    fn load_initial_seeds(&mut self, seed_paths: &[PathBuf]) -> Result<usize, CorpusError> {
+        let mut count = 0;
+        for path in seed_paths {
+            if path.is_file() {
+                let data_bytes = fs::read(path)?;
+                let input_obj = I::from(data_bytes);
+                let meta: Box<dyn Any + Send + Sync> = Box::new(format!("Seed: {:?}", path));
+                self.add(input_obj, meta)?;
+                count += 1;
+            } else if path.is_dir() {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    let file_path = entry.path();
+                    if file_path.is_file() {
+                        let data_bytes = fs::read(&file_path)?;
+                        let input_obj = I::from(data_bytes);
+                        let meta: Box<dyn Any + Send + Sync> =
+                            Box::new(format!("Seed Dir: {:?}", file_path));
+                        self.add(input_obj, meta)?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct OnDiskCorpusEntryMetadata {
     pub source_description: String,
-    // TODO: Add other simple, serializable metadata fields here
-    // pub discovery_time: u64, // epoch seconds
-    // pub executions: u64,
 }
 
-pub struct OnDiskCorpus<I: Input + Serialize + for<'de> Deserialize<'de>> {
+#[derive(Debug)]
+struct OnDiskCorpusCache<I: Input> {
+    id: usize,
+    input: I,
+    metadata_wrapper: Box<dyn Any + Send + Sync>,
+}
+
+#[derive(Debug)]
+pub struct OnDiskCorpus<I: Input + Serialize + for<'de> Deserialize<'de> + Encode + Decode<()>> {
     corpus_dir: PathBuf,
-    entries_index: Vec<(String, OnDiskCorpusEntryMetadata)>,
-    current_id: usize,
+    index_file_path: PathBuf,
+    entries_index: HashMap<String, OnDiskCorpusEntryMetadata>,
+    id_to_stem: Vec<String>,
+    cache: Option<OnDiskCorpusCache<I>>,
     _input_marker: PhantomData<I>,
-    // TODO: For quick duplicate check, if desired, though file existence check on hash can also work
-    // known_input_hashes: HashSet<[u8;16]>,
 }
 
-impl<I: Input + Serialize + for<'de> Deserialize<'de>> OnDiskCorpus<I> {
+impl<I: Input + Serialize + for<'de> Deserialize<'de> + Encode + Decode<()>> OnDiskCorpus<I> {
+    const INDEX_FILENAME: &'static str = "corpus_index.json";
+    const INPUT_FILE_EXTENSION: &'static str = "fuzzinput";
+
     pub fn new(corpus_dir: PathBuf) -> Result<Self, CorpusError> {
         if !corpus_dir.exists() {
-            fs::create_dir_all(&corpus_dir).map_err(|e| {
-                CorpusError::IoError(format!(
-                    "Failed to create corpus directory {corpus_dir:?}: {e}",
-                ))
-            })?;
+            fs::create_dir_all(&corpus_dir)?;
         } else if !corpus_dir.is_dir() {
             return Err(CorpusError::IoError(format!(
-                // Add IoError to CorpusError enum
-                "Corpus path {corpus_dir:?} is not a directory",
+                "Corpus path {:?} is not a directory",
+                corpus_dir
             )));
         }
-        // TODO: Implement loading existing corpus index from disk if present
-        Ok(Self {
+        let index_file_path = corpus_dir.join(Self::INDEX_FILENAME);
+        let mut s = Self {
             corpus_dir,
-            entries_index: Vec::new(),
-            current_id: 0,
+            index_file_path,
+            entries_index: HashMap::new(),
+            id_to_stem: Vec::new(),
+            cache: None,
             _input_marker: PhantomData,
-        })
+        };
+        s.load_index_from_disk().map_err(|e| {
+            CorpusError::IoError(format!("Failed to load corpus index on init: {}", e))
+        })?;
+        Ok(s)
     }
 
-    fn get_file_path(&self, filename_stem: &str) -> PathBuf {
-        self.corpus_dir.join(filename_stem).with_extension("input") // e.g., id_000000.input
+    fn get_file_path_from_stem(&self, filename_stem: &str) -> PathBuf {
+        self.corpus_dir
+            .join(filename_stem)
+            .with_extension(Self::INPUT_FILE_EXTENSION)
     }
 
-    // TODO: Implement saving/loading the entries_index to/from a manifest file
-    // fn save_index(&self) -> Result<(), CorpusError> { ... }
-    // fn load_index(&mut self) -> Result<(), CorpusError> { ... }
+    fn save_index_to_disk(&self) -> Result<(), CorpusError> {
+        let file = BufWriter::new(File::create(&self.index_file_path)?);
+        let data_to_save = (&self.id_to_stem, &self.entries_index);
+        serde_json::to_writer_pretty(file, &data_to_save)?;
+        Ok(())
+    }
+
+    fn load_index_from_disk(&mut self) -> Result<(), CorpusError> {
+        if self.index_file_path.exists() {
+            let file_content = fs::read_to_string(&self.index_file_path)?;
+            if file_content.trim().is_empty() {
+                self.id_to_stem = Vec::new();
+                self.entries_index = HashMap::new();
+                return Ok(());
+            }
+            let (id_to_stem, entries_index) = serde_json::from_str(&file_content)?;
+            self.id_to_stem = id_to_stem;
+            self.entries_index = entries_index;
+        } else {
+            self.id_to_stem = Vec::new();
+            self.entries_index = HashMap::new();
+        }
+        Ok(())
+    }
+
+    fn load_input_from_path(&self, file_path: &PathBuf) -> Result<I, CorpusError> {
+        let file_content = fs::read(file_path)?;
+        let config = bincode_config::standard();
+        let (decoded_val, _len): (I, usize) = bincode::decode_from_slice(&file_content, config)?;
+        Ok(decoded_val)
+    }
 }
 
-impl<I: Input + Serialize + for<'de> Deserialize<'de>> Corpus<I> for OnDiskCorpus<I> {
+impl<I: Input + Serialize + for<'de> Deserialize<'de> + Encode + Decode<()>> Corpus<I>
+    for OnDiskCorpus<I>
+{
     fn add(
         &mut self,
         input: I,
         metadata: Box<dyn Any + Send + Sync>,
     ) -> Result<usize, CorpusError> {
-        // For OnDiskCorpus, we need to decide how to handle the generic Box<dyn Any> metadata.
-        // Option 1: Try to downcast to our specific OnDiskCorpusEntryMetadata
-        // Option 2: For V1, ignore passed metadata and create a default one or use a simple string.
-        // Option 3: Require metadata itself to be serializable (adds complexity to the trait user).
-
-        // Let's go with Option 2 for simplicity in this MVP, but acknowledge the limitation.
-        let on_disk_meta = if let Some(s_meta) = metadata.downcast_ref::<String>() {
+        let on_disk_meta_concrete = if let Some(s_meta) = metadata.downcast_ref::<String>() {
             OnDiskCorpusEntryMetadata {
                 source_description: s_meta.clone(),
             }
@@ -155,195 +245,263 @@ impl<I: Input + Serialize + for<'de> Deserialize<'de>> Corpus<I> for OnDiskCorpu
             od_meta.clone()
         } else {
             OnDiskCorpusEntryMetadata {
-                source_description: format!("entry_{}", self.current_id),
+                source_description: format!("entry_{}", self.id_to_stem.len()),
             }
         };
 
-        let filename_stem = format!("id_{:06}", self.current_id);
-        let file_path = self.get_file_path(&filename_stem);
+        let filename_stem = format!("id_{:06}", self.id_to_stem.len());
+        let file_path = self.get_file_path_from_stem(&filename_stem);
 
-        // Serialize input to bytes. This is where I: Serialize helps.
-        // If I is Vec<u8>, it's just input.as_bytes().
-        // For other I, you'd use bincode, serde_json, etc.
-        // For now, assuming I is Vec<u8> or similar for direct write.
-        // If I must be generic, this needs more thought.
-        // Let's stick to `input.as_bytes()` which `Input` trait provides.
-        let mut file = File::create(&file_path).map_err(|e| {
-            CorpusError::IoError(format!("Failed to create input file {file_path:?}: {e}",))
-        })?;
-        file.write_all(input.as_bytes()).map_err(|e| {
-            CorpusError::IoError(format!("Failed to write to input file {file_path:?}: {e}",))
-        })?;
+        let config = bincode_config::standard();
+        let bytes_to_write = bincode::encode_to_vec(&input, config)?;
 
-        self.entries_index.push((filename_stem, on_disk_meta));
-        let internal_id = self.entries_index.len() - 1; // This is the Vec index
-        self.current_id += 1; // For next filename
+        let mut file = File::create(&file_path)?;
+        file.write_all(&bytes_to_write)?;
 
-        // TODO: Persist the updated index
-        // self.save_index()?;
+        self.id_to_stem.push(filename_stem.clone());
+        self.entries_index
+            .insert(filename_stem, on_disk_meta_concrete);
 
-        Ok(internal_id) // Return the index within entries_index
+        self.save_index_to_disk()?;
+        Ok(self.id_to_stem.len() - 1)
     }
 
-    fn get(&self, id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
-        // This is tricky. We stored OnDiskCorpusEntryMetadata.
-        // The trait returns &Box<dyn Any...>. We need to reconstruct it.
-        // For MVP, `get` for OnDiskCorpus might be limited or needs careful thought on metadata.
-        // If we only stored inputs, then metadata would be None or a placeholder.
-        // If we store serialized metadata, we'd deserialize it here.
-        //
-        // Simplification for MVP: OnDiskCorpus::get only returns the input, metadata part is problematic
-        // without more infrastructure for dynamic metadata serialization.
-        // Let's assume for now this `get` will be less used or will have limitations.
-        //
-        // A more robust `get` that reads from file and reconstructs:
-        if let Some((filename_stem, _meta_ref_in_index)) = self.entries_index.get(id) {
-            let file_path = self.get_file_path(filename_stem);
-            if let Ok(mut file) = File::open(&file_path) {
-                let mut buffer = Vec::new();
-                if file.read_to_end(&mut buffer).is_ok() {
-                    // Now, how to get from Vec<u8> back to I if I is not Vec<u8>?
-                    // This implies I needs a From<Vec<u8>> or similar, or Deserialize.
-                    // The trait bounds I: Input + Serialize + for<'de> Deserialize<'de>
-                    // and Input requiring as_bytes means we probably assume I can be reconstructed.
-                    // If I is just Vec<u8>, this is easy.
-                    // For this example, let's assume I = Vec<u8> and `from_vec` exists or I is `From<Vec<u8>>`.
-                    // This is a simplification!
-                    //
-                    // This part is highly dependent on how I is defined and if it can be created from Vec<u8>.
-                    // If I = Vec<u8>, then it's just buffer.
-                    // If I is generic, we need a way to construct it.
-                    // The trait bounds `for<'de> Deserialize<'de>` on `I` mean we *could* deserialize it.
-                    // Let's assume for now we store it raw and can deserialize if not Vec<u8>.
-                    //
-                    // This is a placeholder for the actual deserialization.
-                    // If I is Vec<u8>, then I::from(buffer) would work if From<Vec<u8>> for I is impl'd.
-                    // For this example, we CANNOT easily return &I because we just read it.
-                    // The Corpus trait signature `fn get(&self, ...) -> Option<(&I, ...)>` is problematic for on-disk.
-                    // It implies the corpus holds owned `I` instances in memory.
-                    //
-                    // This highlights a design challenge for OnDiskCorpus with the current Corpus trait.
-                    // For now, this `get` will be largely unimplemented or panic for OnDisk.
-                    // A real OnDiskCorpus might load-on-demand and cache, or have a different trait.
-                    //
-                    // Let's make it panic for now to highlight this needs a proper solution.
-                    // A common solution is that `get` returns an owned `I`, or `Corpus` is generic over `&'a I`.
-                    // Or, the primary use of OnDiskCorpus is via `random_select_path` and then loading from path.
-                    //
-                    // Given current trait:
-                    // This is basically impossible to implement correctly for OnDiskCorpus to return &I
-                    // unless we load everything into memory, defeating the purpose.
-                    // For now, this will effectively not work for OnDiskCorpus.
-                    // We will focus on random_select returning a path.
-                    // A "get by ID" would typically return an owned input.
-                    // We'll return None to indicate the limitation for now with current trait.
-                    return None; // Placeholder, see comments above.
-                }
+    fn get(&mut self, id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
+        if let Some(cached_item) = self.cache.take() {
+            if cached_item.id == id {
+                self.cache = Some(cached_item);
+                return self.cache.as_ref().map(|c| (&c.input, &c.metadata_wrapper));
             }
         }
-        None
+
+        let filename_stem = match self.id_to_stem.get(id) {
+            Some(s) => s.clone(),
+            None => return None,
+        };
+
+        let file_path = self.get_file_path_from_stem(&filename_stem);
+        match self.entries_index.get(&filename_stem) {
+            Some(persisted_meta_concrete) => match self.load_input_from_path(&file_path) {
+                Ok(input_data) => {
+                    let new_metadata_wrapper: Box<dyn Any + Send + Sync> =
+                        Box::new(persisted_meta_concrete.clone());
+
+                    self.cache = Some(OnDiskCorpusCache {
+                        id,
+                        input: input_data,
+                        metadata_wrapper: new_metadata_wrapper,
+                    });
+                    self.cache.as_ref().map(|c| (&c.input, &c.metadata_wrapper))
+                }
+                Err(e) => {
+                    eprintln!("Error loading input for ID {}: {:?}", id, e);
+                    None
+                }
+            },
+            None => {
+                eprintln!(
+                    "Corpus index inconsistency: stem for ID {} found but no metadata.",
+                    id
+                );
+                None
+            }
+        }
     }
 
     fn random_select(
-        &self,
-        _rng: &mut dyn RngCore,
+        &mut self,
+        rng: &mut dyn RngCore,
     ) -> Option<(usize, &I, &Box<dyn Any + Send + Sync>)> {
-        // Similar issue to get(): returning &I is hard if it's read from disk on demand.
-        // This method also needs rethinking for an OnDiskCorpus if we don't load all into memory.
-        //
-        // Common strategy for on-disk:
-        // 1. List all files in self.corpus_dir.
-        // 2. Pick one randomly.
-        // 3. Load it from disk (returns owned I).
-        // This doesn't fit the `&I` return type.
-        //
-        // For now, like get(), this will be problematic.
-        // Let's assume the `entries_index` is small enough to be in memory, but the actual inputs `I`
-        // are on disk.
-        //
-        // To adhere to the trait for now, this would imply loading a random input into some temporary
-        // owned storage within the OnDiskCorpus struct just to return a reference, which is bad.
-        //
-        // Let's make this also largely non-functional for now, pointing to the trait design issue
-        // for on-disk scenarios.
-        if self.entries_index.is_empty() {
+        if self.id_to_stem.is_empty() {
+            self.cache = None;
             return None;
         }
-        // This would select from the index, but then we can't return &I and &Box<dyn Any>
-        // that live only for the scope of this function after reading from disk.
-        // let idx = rng.next_u32() as usize % self.entries_index.len();
-        // ... then load from disk ...
-        None // Placeholder
+        let id = rng.next_u32() as usize % self.id_to_stem.len();
+        self.get(id)
+            .map(|(input_ref, meta_ref)| (id, input_ref, meta_ref))
     }
 
     fn len(&self) -> usize {
-        self.entries_index.len()
-        // Or, more accurately for on-disk: count files in self.corpus_dir.
-        // For now, based on our in-memory index of what we've added.
+        self.id_to_stem.len()
+    }
+
+    fn load_initial_seeds(&mut self, seed_paths: &[PathBuf]) -> Result<usize, CorpusError> {
+        let mut count = 0;
+        for path in seed_paths {
+            if path.is_file() {
+                let input_obj: I = self.load_input_from_path(path)?;
+                let meta_desc = format!("Initial Seed File: {:?}", path);
+                let on_disk_meta = OnDiskCorpusEntryMetadata {
+                    source_description: meta_desc,
+                };
+                let meta_any: Box<dyn Any + Send + Sync> = Box::new(on_disk_meta);
+                self.add(input_obj, meta_any)?;
+                count += 1;
+            } else if path.is_dir() {
+                for entry in fs::read_dir(path)? {
+                    let entry = entry?;
+                    let file_path = entry.path();
+                    if file_path.is_file() {
+                        let input_obj: I = self.load_input_from_path(&file_path)?;
+                        let meta_desc = format!("Initial Seed Dir: {:?}", file_path);
+                        let on_disk_meta = OnDiskCorpusEntryMetadata {
+                            source_description: meta_desc,
+                        };
+                        let meta_any: Box<dyn Any + Send + Sync> = Box::new(on_disk_meta);
+                        self.add(input_obj, meta_any)?;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
     }
 }
 
 #[cfg(test)]
 mod on_disk_corpus_tests {
     use super::*;
+    use bincode::{Decode, Encode};
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
-    use tempfile::tempdir; // For creating temporary directories for tests
+    use tempfile::tempdir;
 
-    // Simple metadata for testing OnDiskCorpus
-    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-    struct DiskMeta {
-        desc: String,
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Encode, Decode)]
+    struct TestInputStruct {
+        data: Vec<u8>,
+        id_num: u32,
+    }
+    impl Input for TestInputStruct {
+        fn as_bytes(&self) -> &[u8] {
+            &self.data
+        }
+        fn len(&self) -> usize {
+            self.data.len()
+        }
+        fn is_empty(&self) -> bool {
+            self.data.is_empty()
+        }
+    }
+
+    impl From<Vec<u8>> for TestInputStruct {
+        fn from(vec: Vec<u8>) -> Self {
+            let config = bincode_config::standard();
+            bincode::decode_from_slice(&vec, config).map(|(val, _)| val).unwrap_or_else(|e| {
+                eprintln!("Warning: Failed to deserialize TestInputStruct in From<Vec<u8>>: {:?}, using default.", e);
+                TestInputStruct { data: vec, id_num: 0 }
+            })
+        }
     }
 
     #[test]
-    fn on_disk_corpus_create_and_add() -> Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?; // Create a temp directory for this test
+    fn on_disk_corpus_vec_u8() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
         let mut corpus: OnDiskCorpus<Vec<u8>> = OnDiskCorpus::new(dir.path().to_path_buf())?;
 
         let input1_data: Vec<u8> = vec![1, 2, 3, 4, 5];
-        // For OnDiskCorpus, the metadata passed to add() should ideally be what it expects to store,
-        // or it creates its own.
-        let meta1: Box<dyn Any + Send + Sync> = Box::new(OnDiskCorpusEntryMetadata {
-            source_description: "seed1".to_string(),
-        });
-        let id1 = corpus.add(input1_data.clone(), meta1)?;
-        assert_eq!(id1, 0);
+        let meta1_any: Box<dyn Any + Send + Sync> = Box::new("seed1_vec_u8".to_string());
+
+        let id1 = corpus.add(input1_data.clone(), meta1_any)?;
         assert_eq!(corpus.len(), 1);
 
-        // Verify file was created
-        let expected_file_path = dir.path().join("id_000000.input");
+        let expected_file_path = dir.path().join("id_000000.fuzzinput");
         assert!(expected_file_path.exists());
-        let content = fs::read(expected_file_path)?;
-        assert_eq!(content, input1_data);
+        let file_content = fs::read(expected_file_path)?;
+        let config = bincode_config::standard();
+        let (deserialized_input, _len): (Vec<u8>, usize) =
+            bincode::decode_from_slice(&file_content, config)?;
+        assert_eq!(deserialized_input, input1_data);
 
-        let input2_data: Vec<u8> = vec![6, 7, 8];
-        let meta2: Box<dyn Any + Send + Sync> = Box::new("seed2_as_string_meta".to_string());
-        let id2 = corpus.add(input2_data.clone(), meta2)?;
-        assert_eq!(id2, 1);
-        assert_eq!(corpus.len(), 2);
-
-        let expected_file_path2 = dir.path().join("id_000001.input");
-        assert!(expected_file_path2.exists());
-        let content2 = fs::read(expected_file_path2)?;
-        assert_eq!(content2, input2_data);
-
-        // Test `get` and `random_select` limitations for OnDiskCorpus
-        // For now, they return None as per current simplified impl.
         let mut rng = ChaCha8Rng::from_seed([0; 32]);
-        assert!(
-            corpus.get(0).is_none(),
-            "OnDiskCorpus::get is currently limited"
-        );
-        assert!(
-            corpus.random_select(&mut rng).is_none(),
-            "OnDiskCorpus::random_select is currently limited"
-        );
+        if let Some((selected_id, selected_input, selected_meta_wrapper)) =
+            corpus.random_select(&mut rng)
+        {
+            assert_eq!(selected_id, id1);
+            assert_eq!(selected_input, &input1_data);
+            let meta_concrete = selected_meta_wrapper
+                .downcast_ref::<OnDiskCorpusEntryMetadata>()
+                .unwrap();
+            assert_eq!(meta_concrete.source_description, "seed1_vec_u8");
+        } else {
+            panic!("random_select failed for Vec<u8>");
+        }
 
-        dir.close()?; // Clean up temp directory
+        if let Some((get_input, get_meta_wrapper)) = corpus.get(id1) {
+            assert_eq!(get_input, &input1_data);
+            let meta_concrete = get_meta_wrapper
+                .downcast_ref::<OnDiskCorpusEntryMetadata>()
+                .unwrap();
+            assert_eq!(meta_concrete.source_description, "seed1_vec_u8");
+        } else {
+            panic!("get(0) failed for Vec<u8>");
+        }
+
+        dir.close()?;
         Ok(())
     }
 
+    #[test]
+    fn on_disk_corpus_custom_struct() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let mut corpus: OnDiskCorpus<TestInputStruct> =
+            OnDiskCorpus::new(dir.path().to_path_buf())?;
+
+        let input1_data = TestInputStruct {
+            data: vec![10, 20],
+            id_num: 1,
+        };
+        let meta1_any: Box<dyn Any + Send + Sync> = Box::new("seed1_struct".to_string());
+
+        let _id1 = corpus.add(input1_data.clone(), meta1_any)?;
+        assert_eq!(corpus.len(), 1);
+
+        let expected_file_path = dir.path().join("id_000000.fuzzinput");
+        assert!(expected_file_path.exists());
+        let file_content = fs::read(expected_file_path)?;
+        let config = bincode_config::standard();
+        let (deserialized_input, _len): (TestInputStruct, usize) =
+            bincode::decode_from_slice(&file_content, config)?;
+        assert_eq!(deserialized_input, input1_data);
+
+        let mut rng = ChaCha8Rng::from_seed([0; 32]);
+        if let Some((_id, selected_input, _meta)) = corpus.random_select(&mut rng) {
+            assert_eq!(selected_input, &input1_data);
+        } else {
+            panic!("random_select failed for TestInputStruct");
+        }
+        dir.close()?;
+        Ok(())
+    }
+
+    #[test]
+    fn on_disk_corpus_index_persistence() -> Result<(), Box<dyn std::error::Error>> {
+        let dir = tempdir()?;
+        let corpus_path = dir.path().to_path_buf();
+        let input1_data: Vec<u8> = vec![1, 2, 3];
+        let meta1_str = "entry_one".to_string();
+
+        {
+            let mut corpus: OnDiskCorpus<Vec<u8>> = OnDiskCorpus::new(corpus_path.clone())?;
+            assert_eq!(corpus.len(), 0);
+            corpus.add(input1_data.clone(), Box::new(meta1_str.clone()))?;
+            assert_eq!(corpus.len(), 1);
+        }
+
+        let mut reloaded_corpus: OnDiskCorpus<Vec<u8>> = OnDiskCorpus::new(corpus_path)?;
+        assert_eq!(reloaded_corpus.len(), 1, "Should load 1 entry from index");
+
+        if let Some((input_ref, meta_wrapper_ref)) = reloaded_corpus.get(0) {
+            assert_eq!(input_ref, &input1_data);
+            let meta_concrete = meta_wrapper_ref
+                .downcast_ref::<OnDiskCorpusEntryMetadata>()
+                .unwrap();
+            assert_eq!(meta_concrete.source_description, meta1_str);
+        } else {
+            panic!("Failed to get entry from reloaded corpus");
+        }
+        dir.close()?;
+        Ok(())
+    }
     #[test]
     fn on_disk_corpus_new_dir_creation() -> Result<(), Box<dyn std::error::Error>> {
         let base_temp_dir = tempdir()?;
@@ -362,14 +520,14 @@ mod on_disk_corpus_tests {
     fn on_disk_corpus_path_is_file_error() -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let file_path = dir.path().join("iam_a_file.txt");
-        File::create(&file_path)?; // Create a file
+        File::create(&file_path)?;
 
         let result = OnDiskCorpus::<Vec<u8>>::new(file_path);
         assert!(result.is_err());
         if let Err(CorpusError::IoError(msg)) = result {
             assert!(msg.contains("not a directory"));
         } else {
-            panic!("Expected IoError for non-directory path");
+            panic!("Expected IoError for non-directory path, got {:?}", result);
         }
         dir.close()?;
         Ok(())
@@ -382,7 +540,7 @@ mod in_memory_corpus_test {
     use rand_chacha::ChaCha8Rng;
     use rand_core::SeedableRng;
 
-    #[derive(Debug, PartialEq, Eq)]
+    #[derive(Debug, PartialEq, Eq, Clone)]
     struct TestMetadata {
         info: String,
     }
@@ -391,14 +549,14 @@ mod in_memory_corpus_test {
     fn in_memory_corpus_add_and_get() {
         let mut corpus: InMemoryCorpus<Vec<u8>> = InMemoryCorpus::new();
         let input1 = vec![1, 2, 3];
-        let meta1 = Box::new(TestMetadata {
+        let meta1: Box<dyn Any + Send + Sync> = Box::new(TestMetadata {
             info: "first".to_string(),
         });
         let id1 = corpus.add(input1.clone(), meta1).unwrap();
         assert_eq!(id1, 0);
 
         let input2 = vec![4, 5, 6];
-        let meta2 = Box::new(TestMetadata {
+        let meta2: Box<dyn Any + Send + Sync> = Box::new(TestMetadata {
             info: "second".to_string(),
         });
         let id2 = corpus.add(input2.clone(), meta2).unwrap();
@@ -474,5 +632,36 @@ mod in_memory_corpus_test {
             )
             .unwrap();
         assert!(!corpus.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dummy_corpus_for_mutator_tests {
+    use super::*;
+
+    pub struct DummyCorpusForMutator;
+    impl<I: Input> Corpus<I> for DummyCorpusForMutator {
+        fn add(
+            &mut self,
+            _input: I,
+            _metadata: Box<dyn Any + Send + Sync>,
+        ) -> Result<usize, CorpusError> {
+            Ok(0)
+        }
+        fn get(&mut self, _id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
+            None
+        }
+        fn random_select(
+            &mut self,
+            _rng: &mut dyn RngCore,
+        ) -> Option<(usize, &I, &Box<dyn Any + Send + Sync>)> {
+            None
+        }
+        fn len(&self) -> usize {
+            0
+        }
+        fn load_initial_seeds(&mut self, _seed_paths: &[PathBuf]) -> Result<usize, CorpusError> {
+            Ok(0)
+        }
     }
 }

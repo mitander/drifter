@@ -12,6 +12,8 @@ thiserror = "2.0.12"
 tempfile = "3.19.1"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8.22"
+bincode = { version = "2.0.1", features = ["derive"] }
+serde_json = "1.0.140"
 
 [dev-dependencies]
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }

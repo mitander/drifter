@@ -15,7 +15,7 @@ pub enum SchedulerError {
 pub trait Scheduler<I: Input>: Send + Sync {
     fn next(
         &mut self,
-        corpus: &dyn Corpus<I>,
+        corpus: &mut dyn Corpus<I>,
         rng: &mut dyn RngCore,
     ) -> Result<usize, SchedulerError>;
     fn report_feedback(&mut self, input_id: usize, feedback_value: &dyn Any, is_solution: bool);
@@ -33,7 +33,7 @@ impl RandomScheduler {
 impl<I: Input> Scheduler<I> for RandomScheduler {
     fn next(
         &mut self,
-        corpus: &dyn Corpus<I>,
+        corpus: &mut dyn Corpus<I>,
         rng: &mut dyn RngCore,
     ) -> Result<usize, SchedulerError> {
         if corpus.is_empty() {
@@ -60,12 +60,12 @@ mod tests {
     #[test]
     fn random_scheduler_next() {
         let mut scheduler = RandomScheduler::new();
-        let mut corpus: InMemoryCorpus<Vec<u8>> = InMemoryCorpus::new();
+        let mut corpus: InMemoryCorpus<Vec<u8>> = InMemoryCorpus::new(); // corpus is mut
         let mut rng = ChaCha8Rng::from_seed([0; 32]);
 
-        match scheduler.next(&corpus, &mut rng) {
+        match scheduler.next(&mut corpus, &mut rng) {
             Err(SchedulerError::CorpusEmpty) => {}
-            Err(e) => panic!("Expected CorpusEmpty error, got {e:?}"),
+            Err(e) => panic!("Expected CorpusEmpty error, got {:?}", e),
             Ok(_) => panic!("Expected error for empty corpus, got Ok"),
         }
 
@@ -77,7 +77,7 @@ mod tests {
 
         let mut selected_count = 0;
         for _ in 0..10 {
-            if scheduler.next(&corpus, &mut rng).is_ok() {
+            if scheduler.next(&mut corpus, &mut rng).is_ok() {
                 selected_count += 1;
             }
         }

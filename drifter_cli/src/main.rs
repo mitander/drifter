@@ -1,7 +1,7 @@
 use drifter_core::config::{
     CorpusType, DrifterConfig, ExecutorType as ConfigExecutorType, default_iterations,
 };
-use drifter_core::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus};
+use drifter_core::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus, OnDiskCorpusEntryMetadata};
 use drifter_core::executor::{
     CommandExecutor, CommandExecutorConfig, Executor, InProcessExecutor,
     InputDelivery as CoreInputDelivery,
@@ -146,29 +146,17 @@ fn main() -> Result<(), anyhow::Error> {
 
     if let Some(corpus_conf) = &config.corpus {
         if let Some(seed_paths) = &corpus_conf.initial_seed_paths {
-            for path in seed_paths {
-                if path.is_file() {
-                    let data = std::fs::read(path)?;
-                    let meta: Box<dyn Any + Send + Sync> = Box::new(format!("Seed: {path:?}"));
-                    corpus.add(data, meta)?;
-                } else if path.is_dir() {
-                    for entry in std::fs::read_dir(path)? {
-                        let entry = entry?;
-                        let file_path = entry.path();
-                        if file_path.is_file() {
-                            let data = std::fs::read(&file_path)?;
-                            let meta: Box<dyn Any + Send + Sync> =
-                                Box::new(format!("Seed: {file_path:?}"));
-                            corpus.add(data, meta)?;
-                        }
-                    }
-                }
-            }
+            let num_loaded = corpus.load_initial_seeds(seed_paths)?;
+            println!("Loaded {num_loaded} initial seeds from paths.");
         }
     }
+
     if corpus.is_empty() {
+        println!("No initial seeds provided or found, adding a default seed.");
         let default_seed_data = vec![b'I', b'N', b'I', b'T'];
-        let meta: Box<dyn Any + Send + Sync> = Box::new("Default Initial Seed".to_string());
+        let meta: Box<dyn Any + Send + Sync> = Box::new(OnDiskCorpusEntryMetadata {
+            source_description: "Default Initial Seed".to_string(),
+        });
         corpus.add(default_seed_data, meta)?;
     }
 
@@ -179,20 +167,18 @@ fn main() -> Result<(), anyhow::Error> {
     let mut observers_list: Vec<&mut dyn Observer> = vec![&mut noop_observer];
 
     for i in 0..corpus.len() {
-        if let Some((input_ref, _)) = corpus.get(i) {
+        if let Some((input_ref, _)) = corpus.as_mut().get(i) {
             if let Some(uif) = feedback_processor
                 .as_mut()
                 .as_any_mut()
                 .downcast_mut::<UniqueInputFeedback>()
             {
                 uif.add_known_input_hash(input_ref);
-            } else {
-                // Generic feedback might have an init that scans the corpus.
             }
         }
     }
-    feedback_processor.init(corpus.as_ref())?;
 
+    feedback_processor.init(corpus.as_ref())?; // Pass &dyn Corpus
     let max_iterations = config
         .fuzzer
         .as_ref()
@@ -210,7 +196,7 @@ fn main() -> Result<(), anyhow::Error> {
     for i in 0..max_iterations {
         let (base_input_id, base_input_to_mutate) = match scheduler
             .as_mut()
-            .next(corpus.as_ref(), &mut rng)
+            .next(corpus.as_mut(), &mut rng)
         {
             Ok(id) => {
                 let (input_ref, _meta_ref) =

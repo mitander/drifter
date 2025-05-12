@@ -48,6 +48,7 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
     use rand_core::{RngCore, SeedableRng};
     use std::any::Any;
+    use std::path::PathBuf;
 
     struct DummyCorpus;
     impl<I: Input> Corpus<I> for DummyCorpus {
@@ -58,17 +59,20 @@ mod tests {
         ) -> Result<usize, CorpusError> {
             Ok(0)
         }
-        fn get(&self, _id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
+        fn get(&mut self, _id: usize) -> Option<(&I, &Box<dyn Any + Send + Sync>)> {
             None
         }
         fn random_select(
-            &self,
+            &mut self,
             _rng: &mut dyn RngCore,
         ) -> Option<(usize, &I, &Box<dyn Any + Send + Sync>)> {
             None
         }
         fn len(&self) -> usize {
             0
+        }
+        fn load_initial_seeds(&mut self, _seed_paths: &[PathBuf]) -> Result<usize, CorpusError> {
+            Ok(0)
         }
     }
 
