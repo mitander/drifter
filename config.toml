@@ -7,7 +7,7 @@ executor-type = "command"
 command-settings = { command = ["./test_targets/test_target_stdin_check.sh"], input-delivery = "std-in", timeout-ms = 1500 }
 
 [corpus]
-corpus-type = "in-memory"
+corpus-type = "on-disk"
 initial-seed-paths = ["seeds/seed1.txt", "seeds/another_seed.bin"]
 
 # TODO:

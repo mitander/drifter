@@ -67,7 +67,12 @@ pub struct CorpusConfig {
     #[serde(default = "default_corpus_type")]
     pub corpus_type: CorpusType,
     pub initial_seed_paths: Option<Vec<PathBuf>>,
-    pub on_disk_path: Option<PathBuf>,
+    #[serde(default = "default_on_disk_path")]
+    pub on_disk_path: PathBuf,
+}
+
+pub fn default_on_disk_path() -> PathBuf {
+    PathBuf::from("./.drifter_corpus")
 }
 
 fn default_corpus_type() -> CorpusType {
@@ -134,7 +139,7 @@ impl Default for DrifterConfig {
             corpus: Some(CorpusConfig {
                 corpus_type: default_corpus_type(),
                 initial_seed_paths: None,
-                on_disk_path: None,
+                on_disk_path: default_on_disk_path(),
             }),
         }
     }

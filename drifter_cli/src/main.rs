@@ -1,10 +1,7 @@
-use drifter_core::config::{
-    CorpusType, DrifterConfig, ExecutorType as ConfigExecutorType, default_iterations,
-};
+use drifter_core::config::{CorpusType, DrifterConfig, ExecutorType, default_iterations};
 use drifter_core::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus, OnDiskCorpusEntryMetadata};
 use drifter_core::executor::{
-    CommandExecutor, CommandExecutorConfig, Executor, InProcessExecutor,
-    InputDelivery as CoreInputDelivery,
+    CommandExecutor, CommandExecutorConfig, Executor, InProcessExecutor, InputDelivery,
 };
 use drifter_core::feedback::{Feedback, UniqueInputFeedback};
 use drifter_core::mutator::{FlipSingleByteMutator, Mutator};
@@ -44,16 +41,13 @@ fn main() -> Result<(), anyhow::Error> {
     let cli = Cli::parse();
 
     let mut config = match cli.config_file {
-        Some(config_path) => {
-            println!("Loading configuration from specified path: {config_path:?}",);
-            DrifterConfig::load_from_file(&config_path)?
-        }
+        Some(config_path) => DrifterConfig::load_from_file(&config_path)?,
         None => {
-            // No config file specified via CLI, load default
             let default_config_path = PathBuf::from("config.toml");
             if default_config_path.exists() {
                 println!(
-                    "No config file specified via CLI, loading default: {default_config_path:?}",
+                    "No config file specified via CLI, loading default: {:?}",
+                    default_config_path
                 );
                 DrifterConfig::load_from_file(&default_config_path)?
             } else {
@@ -72,7 +66,7 @@ fn main() -> Result<(), anyhow::Error> {
             .max_iterations = iterations;
     }
     if let Some(target_cmd_str) = cli.target_command {
-        if config.executor.executor_type == ConfigExecutorType::Command {
+        if config.executor.executor_type == ExecutorType::Command {
             let cmd_settings = config.executor.command_settings.get_or_insert_with(|| {
                 drifter_core::config::CommandExecutorSettings {
                     command: Vec::new(),
@@ -93,26 +87,24 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    println!("Effective configuration: {config:#?}");
+    println!("Effective configuration: {:#?}", config);
 
     let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
 
     let mut mutator: Box<dyn Mutator<Vec<u8>>> = Box::new(FlipSingleByteMutator);
 
     let mut executor: Box<dyn Executor<Vec<u8>>> = match config.executor.executor_type {
-        ConfigExecutorType::InProcess => Box::new(InProcessExecutor::new(my_harness)),
-        ConfigExecutorType::Command => {
+        ExecutorType::InProcess => Box::new(InProcessExecutor::new(my_harness)),
+        ExecutorType::Command => {
             let cmd_settings = config.executor.command_settings.ok_or_else(|| {
                 anyhow::anyhow!("Command settings missing for CommandExecutor type in config")
             })?;
-
             let core_input_delivery = match cmd_settings.input_delivery {
-                drifter_core::config::ConfigInputDelivery::StdIn => CoreInputDelivery::StdIn,
+                drifter_core::config::ConfigInputDelivery::StdIn => InputDelivery::StdIn,
                 drifter_core::config::ConfigInputDelivery::File { template } => {
-                    CoreInputDelivery::File(template)
+                    InputDelivery::File(template)
                 }
             };
-
             let exec_config = CommandExecutorConfig {
                 command: cmd_settings.command,
                 input_delivery: core_input_delivery,
@@ -125,34 +117,39 @@ fn main() -> Result<(), anyhow::Error> {
 
     let oracle: Box<dyn Oracle<Vec<u8>>> = Box::new(CrashOracle);
 
-    let mut corpus: Box<dyn Corpus<Vec<u8>>> = match config.corpus.as_ref().map(|c| &c.corpus_type)
-    {
-        Some(CorpusType::OnDisk) => {
-            let path = config
-                .corpus
-                .as_ref()
-                .unwrap()
-                .on_disk_path
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("on_disk_path missing for OnDiskCorpus"))?;
-            println!("Using OnDiskCorpus at path: {path:?}");
-            Box::new(OnDiskCorpus::<Vec<u8>>::new(path)?)
-        }
-        _ => {
-            println!("Using InMemoryCorpus.");
-            Box::new(InMemoryCorpus::<Vec<u8>>::new())
-        }
-    };
+    let mut corpus: Box<dyn Corpus<Vec<u8>>>;
 
     if let Some(corpus_conf) = &config.corpus {
+        corpus = match &corpus_conf.corpus_type {
+            CorpusType::OnDisk => {
+                println!("Using OnDiskCorpus at path: {:?}", corpus_conf.on_disk_path);
+                Box::new(OnDiskCorpus::<Vec<u8>>::new(
+                    corpus_conf.on_disk_path.clone(),
+                )?)
+            }
+            CorpusType::InMemory => {
+                println!("Using InMemoryCorpus.");
+                Box::new(InMemoryCorpus::<Vec<u8>>::new())
+            }
+        };
+
         if let Some(seed_paths) = &corpus_conf.initial_seed_paths {
-            let num_loaded = corpus.load_initial_seeds(seed_paths)?;
-            println!("Loaded {num_loaded} initial seeds from paths.");
+            if !seed_paths.is_empty() {
+                let num_loaded = corpus.load_initial_seeds(seed_paths)?;
+                println!("Loaded {} initial seeds from paths.", num_loaded);
+            } else {
+                println!("initial_seed_paths was specified but empty in config.");
+            }
+        } else {
+            println!("No initial_seed_paths specified in config.");
         }
+    } else {
+        println!("No [corpus] section in config, defaulting to InMemoryCorpus.");
+        corpus = Box::new(InMemoryCorpus::<Vec<u8>>::new());
     }
 
     if corpus.is_empty() {
-        println!("No initial seeds provided or found, adding a default seed.");
+        println!("Corpus is empty after attempting to load seeds, adding a default seed.");
         let default_seed_data = vec![b'I', b'N', b'I', b'T'];
         let meta: Box<dyn Any + Send + Sync> = Box::new(OnDiskCorpusEntryMetadata {
             source_description: "Default Initial Seed".to_string(),
@@ -177,8 +174,8 @@ fn main() -> Result<(), anyhow::Error> {
             }
         }
     }
+    feedback_processor.init(corpus.as_ref())?;
 
-    feedback_processor.init(corpus.as_ref())?; // Pass &dyn Corpus
     let max_iterations = config
         .fuzzer
         .as_ref()
@@ -199,32 +196,32 @@ fn main() -> Result<(), anyhow::Error> {
             .next(corpus.as_mut(), &mut rng)
         {
             Ok(id) => {
-                let (input_ref, _meta_ref) =
-                        corpus.get(id).expect("Scheduler returned valid ID but corpus.get failed. This indicates an issue with corpus.get for the current corpus type or a logic error.");
+                let (input_ref, _meta_ref) = corpus
+                    .as_mut()
+                    .get(id)
+                    .expect("Scheduler returned valid ID but corpus.get failed.");
                 (id, input_ref.clone())
             }
-            Err(scheduler_error) => {
-                eprintln!(
-                    "\nNote: scheduler.next() failed (Error: {:?}, Corpus len: {}). Attempting to generate a new seed input.",
-                    scheduler_error,
-                    corpus.len()
-                );
-
-                let generated_input = mutator.mutate(None, &mut rng, Some(corpus.as_ref()))?; // Generate from scratch
-
-                let meta: Box<dyn Any + Send + Sync> =
-                    Box::new("Generated-During-Loop".to_string());
-                let new_id = corpus.add(generated_input.clone(), meta)?;
-
+            Err(_e) => {
+                if corpus.is_empty() {
+                    println!(
+                        "Corpus empty, cannot schedule. Fuzzing loop will stop if no new inputs are generated."
+                    );
+                    break;
+                }
+                let generated = mutator.mutate(None, &mut rng, Some(corpus.as_ref()))?;
+                let meta: Box<dyn Any + Send + Sync> = Box::new(OnDiskCorpusEntryMetadata {
+                    source_description: "Emergency Generated Seed".to_string(),
+                });
+                let new_id = corpus.add(generated.clone(), meta)?;
                 if let Some(uif) = feedback_processor
                     .as_mut()
                     .as_any_mut()
                     .downcast_mut::<UniqueInputFeedback>()
                 {
-                    uif.add_known_input_hash(&generated_input);
+                    uif.add_known_input_hash(&generated);
                 }
-
-                (new_id, generated_input)
+                (new_id, generated)
             }
         };
 
@@ -253,12 +250,13 @@ fn main() -> Result<(), anyhow::Error> {
         )?;
 
         if let Some(bug_report) = oracle.as_ref().examine(&mutated_input, &status, None) {
-            println!("\n!!! BUG FOUND (Execution {executions}) !!!");
+            println!("\n!!! BUG FOUND (Execution {}) !!!", executions);
             println!("  Input: {:?}", bug_report.input);
             println!("  Description: {}", bug_report.description);
             println!("  Hash: {}", bug_report.hash);
-            let bug_meta: Box<dyn Any + Send + Sync> =
-                Box::new(format!("Crash: {}", bug_report.description));
+            let bug_meta: Box<dyn Any + Send + Sync> = Box::new(OnDiskCorpusEntryMetadata {
+                source_description: format!("Crash: {}", bug_report.description),
+            });
             corpus.add(bug_report.input.clone(), bug_meta)?;
             if let Some(uif) = feedback_processor
                 .as_mut()
@@ -295,7 +293,7 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
     let elapsed_total = start_time.elapsed();
-    println!("\nFuzz loop finished in {elapsed_total:.2?}.");
+    println!("\nFuzz loop finished in {:.2?}.", elapsed_total);
     println!(
         "Total Executions: {}, Corpus Size: {}, Solutions Found: {}",
         executions,
