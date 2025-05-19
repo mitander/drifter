@@ -1,4 +1,7 @@
-use drifter_core::config::{CorpusType, DrifterConfig, ExecutorType, default_iterations};
+use drifter_core::CrashOracle;
+use drifter_core::config::{
+    CorpusType, DrifterConfig, ExecutorType, InProcessExecutorSettings, default_iterations,
+};
 use drifter_core::corpus::{Corpus, InMemoryCorpus, OnDiskCorpus, OnDiskCorpusEntryMetadata};
 use drifter_core::executor::{
     CommandExecutor, CommandExecutorConfig, Executor, InProcessExecutor, InputDelivery,
@@ -6,12 +9,14 @@ use drifter_core::executor::{
 use drifter_core::feedback::{Feedback, UniqueInputFeedback};
 use drifter_core::mutator::{FlipSingleByteMutator, Mutator};
 use drifter_core::observer::{NoOpObserver, Observer};
-use drifter_core::oracle::{CrashOracle, Oracle};
+use drifter_core::oracle::Oracle;
 use drifter_core::scheduler::{RandomScheduler, Scheduler};
+use drifter_core::{SchedulerError, config::CommandExecutorSettings};
 
 use clap::Parser;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
+use rohcstar::fuzz_harnesses::rohc_decompressor_harness;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,7 +33,7 @@ struct Cli {
     iterations: Option<u64>,
 }
 
-fn my_harness(data: &[u8]) {
+fn dummy_harness(data: &[u8]) {
     if data.len() > 2 && data[0] == b'B' && data[1] == b'A' && data[2] == b'D' {
         panic!("BAD input detected by harness!");
     }
@@ -43,7 +48,7 @@ fn main() -> Result<(), anyhow::Error> {
     let mut config = match cli.config_file {
         Some(config_path) => DrifterConfig::load_from_file(&config_path)?,
         None => {
-            let default_config_path = PathBuf::from("config.toml");
+            let default_config_path = PathBuf::from("drifter_config.toml");
             if default_config_path.exists() {
                 println!(
                     "No config file specified via CLI, loading default: {:?}",
@@ -67,34 +72,53 @@ fn main() -> Result<(), anyhow::Error> {
     }
     if let Some(target_cmd_str) = cli.target_command {
         if config.executor.executor_type == ExecutorType::Command {
-            let cmd_settings = config.executor.command_settings.get_or_insert_with(|| {
-                drifter_core::config::CommandExecutorSettings {
-                    command: Vec::new(),
-                    input_delivery: drifter_core::config::ConfigInputDelivery::StdIn,
-                    timeout_ms: 2000,
-                    working_dir: None,
-                }
-            });
+            let cmd_settings = config
+                .executor
+                .command_settings
+                .get_or_insert_with(CommandExecutorSettings::default);
             if !cmd_settings.command.is_empty() {
                 cmd_settings.command[0] = target_cmd_str;
             } else {
                 cmd_settings.command.push(target_cmd_str);
             }
-        } else {
-            println!(
-                "Warning: --target-command specified but executor type is not 'Command'. Override ignored."
-            );
         }
+    }
+    if config.executor.in_process_settings.is_none() {
+        config.executor.in_process_settings = Some(InProcessExecutorSettings::default());
     }
 
     println!("Effective configuration: {:#?}", config);
 
     let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
-
     let mut mutator: Box<dyn Mutator<Vec<u8>>> = Box::new(FlipSingleByteMutator);
 
     let mut executor: Box<dyn Executor<Vec<u8>>> = match config.executor.executor_type {
-        ExecutorType::InProcess => Box::new(InProcessExecutor::new(my_harness)),
+        ExecutorType::InProcess => {
+            let settings = config
+                .executor
+                .in_process_settings
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("InProcessExecutor settings missing in config"))?;
+
+            let harness_fn: fn(&[u8]) = match settings.harness_key.as_str() {
+                "rohcstar_decompressor" => {
+                    println!("Selected Rohcstar decompressor harness.");
+                    rohc_decompressor_harness
+                }
+                "" | "default_dummy" => {
+                    // Default if harness_key is empty or specific key
+                    println!("Using default/dummy in-process harness.");
+                    dummy_harness
+                }
+                unknown_key => {
+                    return Err(anyhow::anyhow!(
+                        "Unknown in-process harness key specified: {}",
+                        unknown_key
+                    ));
+                }
+            };
+            Box::new(InProcessExecutor::new(harness_fn))
+        }
         ExecutorType::Command => {
             let cmd_settings = config.executor.command_settings.ok_or_else(|| {
                 anyhow::anyhow!("Command settings missing for CommandExecutor type in config")
@@ -115,37 +139,37 @@ fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let oracle: Box<dyn Oracle<Vec<u8>>> = Box::new(CrashOracle);
-
     let mut corpus: Box<dyn Corpus<Vec<u8>>>;
 
-    if let Some(corpus_conf) = &config.corpus {
-        corpus = match &corpus_conf.corpus_type {
-            CorpusType::OnDisk => {
-                println!("Using OnDiskCorpus at path: {:?}", corpus_conf.on_disk_path);
-                Box::new(OnDiskCorpus::<Vec<u8>>::new(
-                    corpus_conf.on_disk_path.clone(),
-                )?)
-            }
-            CorpusType::InMemory => {
-                println!("Using InMemoryCorpus.");
-                Box::new(InMemoryCorpus::<Vec<u8>>::new())
-            }
-        };
+    let corpus_conf = config.corpus.unwrap_or_else(|| {
+        println!("No [corpus] section in config, defaulting to InMemoryCorpus with default path.");
+        drifter_core::config::CorpusConfig {
+            corpus_type: CorpusType::default(),
+            initial_seed_paths: None,
+            on_disk_path: drifter_core::config::default_on_disk_path(),
+        }
+    });
 
-        if let Some(seed_paths) = &corpus_conf.initial_seed_paths {
-            if !seed_paths.is_empty() {
-                let num_loaded = corpus.load_initial_seeds(seed_paths)?;
-                println!("Loaded {} initial seeds from paths.", num_loaded);
-            } else {
-                println!("initial_seed_paths was specified but empty in config.");
-            }
+    corpus = match &corpus_conf.corpus_type {
+        CorpusType::OnDisk => {
+            println!("Using OnDiskCorpus at path: {:?}", corpus_conf.on_disk_path);
+            Box::new(OnDiskCorpus::new(corpus_conf.on_disk_path.clone())?)
+        }
+        CorpusType::InMemory => {
+            println!("Using InMemoryCorpus.");
+            Box::new(InMemoryCorpus::new())
+        }
+    };
+
+    if let Some(seed_paths) = &corpus_conf.initial_seed_paths {
+        if !seed_paths.is_empty() {
+            let num_loaded = corpus.load_initial_seeds(seed_paths)?;
+            println!("Loaded {} initial seeds from paths.", num_loaded);
         } else {
-            println!("No initial_seed_paths specified in config.");
+            println!("initial_seed_paths was specified but empty in config.");
         }
     } else {
-        println!("No [corpus] section in config, defaulting to InMemoryCorpus.");
-        corpus = Box::new(InMemoryCorpus::<Vec<u8>>::new());
+        println!("No initial_seed_paths specified in config.");
     }
 
     if corpus.is_empty() {
@@ -164,9 +188,8 @@ fn main() -> Result<(), anyhow::Error> {
     let mut observers_list: Vec<&mut dyn Observer> = vec![&mut noop_observer];
 
     for i in 0..corpus.len() {
-        if let Some((input_ref, _)) = corpus.as_mut().get(i) {
+        if let Some((input_ref, _)) = corpus.get(i) {
             if let Some(uif) = feedback_processor
-                .as_mut()
                 .as_any_mut()
                 .downcast_mut::<UniqueInputFeedback>()
             {
@@ -191,40 +214,58 @@ fn main() -> Result<(), anyhow::Error> {
     let mut solutions_found = 0;
 
     for i in 0..max_iterations {
-        let (base_input_id, base_input_to_mutate) = match scheduler
-            .as_mut()
-            .next(corpus.as_mut(), &mut rng)
+        let (base_input_id, base_input_to_mutate) = match scheduler.next(corpus.as_mut(), &mut rng)
         {
             Ok(id) => {
                 let (input_ref, _meta_ref) = corpus
-                    .as_mut()
                     .get(id)
                     .expect("Scheduler returned valid ID but corpus.get failed.");
                 (id, input_ref.clone())
             }
-            Err(_e) => {
+            Err(SchedulerError::CorpusEmpty) => {
                 if corpus.is_empty() {
                     println!(
-                        "Corpus empty, cannot schedule. Fuzzing loop will stop if no new inputs are generated."
+                        "Corpus empty, cannot schedule. Attempting to generate a new seed or stopping."
+                    );
+                    if let Ok(generated) = mutator.mutate(None, &mut rng, Some(corpus.as_ref())) {
+                        let meta: Box<dyn Any + Send + Sync> =
+                            Box::new(OnDiskCorpusEntryMetadata {
+                                source_description: "Emergency Generated Seed From Empty"
+                                    .to_string(),
+                            });
+                        match corpus.add(generated.clone(), meta) {
+                            Ok(new_id) => {
+                                if let Some(uif) = feedback_processor
+                                    .as_any_mut()
+                                    .downcast_mut::<UniqueInputFeedback>()
+                                {
+                                    uif.add_known_input_hash(&generated);
+                                }
+                                (new_id, generated)
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to add emergency seed: {:?}", e);
+                                break;
+                            }
+                        }
+                    } else {
+                        eprintln!("Mutator failed to generate seed from scratch. Stopping.");
+                        break;
+                    }
+                } else {
+                    eprintln!(
+                        "Scheduler reported corpus empty, but corpus.is_empty() is false. This is unexpected. Stopping."
                     );
                     break;
                 }
-                let generated = mutator.mutate(None, &mut rng, Some(corpus.as_ref()))?;
-                let meta: Box<dyn Any + Send + Sync> = Box::new(OnDiskCorpusEntryMetadata {
-                    source_description: "Emergency Generated Seed".to_string(),
-                });
-                let new_id = corpus.add(generated.clone(), meta)?;
-                if let Some(uif) = feedback_processor
-                    .as_mut()
-                    .as_any_mut()
-                    .downcast_mut::<UniqueInputFeedback>()
-                {
-                    uif.add_known_input_hash(&generated);
-                }
-                (new_id, generated)
+            }
+            Err(e) => {
+                eprintln!("Scheduler error: {:?}. Stopping.", e);
+                break;
             }
         };
 
+        let oracle: Box<dyn Oracle<Vec<u8>>> = Box::new(CrashOracle);
         let mutated_input =
             mutator.mutate(Some(&base_input_to_mutate), &mut rng, Some(corpus.as_ref()))?;
         executions += 1;
@@ -232,9 +273,7 @@ fn main() -> Result<(), anyhow::Error> {
         for obs in observers_list.iter_mut() {
             obs.reset()?;
         }
-        let status = executor
-            .as_mut()
-            .execute_sync(&mutated_input, &mut observers_list);
+        let status = executor.execute_sync(&mutated_input, &mut observers_list);
 
         let mut observers_data_map = HashMap::new();
         for obs in observers_list.iter() {
@@ -242,14 +281,14 @@ fn main() -> Result<(), anyhow::Error> {
         }
 
         let mut is_solution = false;
-        let _was_added_by_feedback = feedback_processor.as_mut().process_execution(
+        let _was_added_by_feedback = feedback_processor.process_execution(
             &mutated_input,
             mutated_input.clone(),
             &observers_data_map,
             corpus.as_mut(),
         )?;
 
-        if let Some(bug_report) = oracle.as_ref().examine(&mutated_input, &status, None) {
+        if let Some(bug_report) = oracle.examine(&mutated_input, &status, None) {
             println!("\n!!! BUG FOUND (Execution {}) !!!", executions);
             println!("  Input: {:?}", bug_report.input);
             println!("  Description: {}", bug_report.description);
@@ -259,7 +298,6 @@ fn main() -> Result<(), anyhow::Error> {
             });
             corpus.add(bug_report.input.clone(), bug_meta)?;
             if let Some(uif) = feedback_processor
-                .as_mut()
                 .as_any_mut()
                 .downcast_mut::<UniqueInputFeedback>()
             {
@@ -269,9 +307,7 @@ fn main() -> Result<(), anyhow::Error> {
             solutions_found += 1;
         }
 
-        scheduler
-            .as_mut()
-            .report_feedback(base_input_id, &"some_feedback_value", is_solution);
+        scheduler.report_feedback(base_input_id, &"some_feedback_value", is_solution);
 
         if i > 0 && i % (max_iterations / 100).max(1) == 0 {
             let elapsed = start_time.elapsed().as_secs_f32();
@@ -282,7 +318,7 @@ fn main() -> Result<(), anyhow::Error> {
             };
             print!(
                 "\rIter: {}/{}, Corpus: {}, Solutions: {}, Execs/sec: {:.2}   ",
-                i,
+                i + 1,
                 max_iterations,
                 corpus.len(),
                 solutions_found,
@@ -292,6 +328,7 @@ fn main() -> Result<(), anyhow::Error> {
             std::io::stdout().flush().unwrap();
         }
     }
+
     let elapsed_total = start_time.elapsed();
     println!("\nFuzz loop finished in {:.2?}.", elapsed_total);
     println!(

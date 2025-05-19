@@ -10,5 +10,7 @@ target/
 *.pdb
 
 # Drifter Fuzzer Output
-# Default on-disk corpus directory
 /.drifter_corpus/
+
+# Rohcstar Fuzzer Output
+/.drifter_rohcstar_corpus/

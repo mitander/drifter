@@ -1,14 +1,17 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfigInputDelivery {
+    #[default]
     StdIn,
-    File { template: String },
+    File {
+        template: String,
+    },
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub struct CommandExecutorSettings {
@@ -17,36 +20,44 @@ pub struct CommandExecutorSettings {
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
     pub working_dir: Option<PathBuf>,
-    // TODO: pub envs: Option<HashMap<String, String>>,
 }
 
 fn default_timeout_ms() -> u64 {
     2000
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutorType {
     InProcess,
+    #[default]
     Command,
 }
 
-fn default_executor_type() -> ExecutorType {
-    ExecutorType::Command
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "kebab-case")]
+#[serde(deny_unknown_fields)]
+pub struct InProcessExecutorSettings {
+    #[serde(default)]
+    pub harness_key: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub struct ExecutorConfig {
-    #[serde(default = "default_executor_type")]
+    #[serde(default)]
     pub executor_type: ExecutorType,
+    #[serde(default)]
     pub command_settings: Option<CommandExecutorSettings>,
+    #[serde(default)]
+    pub in_process_settings: Option<InProcessExecutorSettings>,
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum CorpusType {
+    #[default]
     InMemory,
     OnDisk,
 }
@@ -109,10 +120,11 @@ impl Default for FuzzerSettings {
 #[serde(rename_all = "kebab-case")]
 #[serde(deny_unknown_fields)]
 pub struct DrifterConfig {
+    #[serde(default)]
     pub fuzzer: Option<FuzzerSettings>,
     pub executor: ExecutorConfig,
+    #[serde(default)]
     pub corpus: Option<CorpusConfig>,
-    // TODO: Add sections for Mutator, Scheduler, Feedback, Oracle config
 }
 
 impl DrifterConfig {
@@ -133,8 +145,9 @@ impl Default for DrifterConfig {
         Self {
             fuzzer: Some(FuzzerSettings::default()),
             executor: ExecutorConfig {
-                executor_type: default_executor_type(),
+                executor_type: ExecutorType::Command,
                 command_settings: None,
+                in_process_settings: Some(InProcessExecutorSettings::default()),
             },
             corpus: Some(CorpusConfig {
                 corpus_type: default_corpus_type(),

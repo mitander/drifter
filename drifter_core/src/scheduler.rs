@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn random_scheduler_next() {
         let mut scheduler = RandomScheduler::new();
-        let mut corpus: InMemoryCorpus<Vec<u8>> = InMemoryCorpus::new(); // corpus is mut
+        let mut corpus: InMemoryCorpus<Vec<u8>> = InMemoryCorpus::new();
         let mut rng = ChaCha8Rng::from_seed([0; 32]);
 
         match scheduler.next(&mut corpus, &mut rng) {

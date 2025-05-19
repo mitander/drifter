@@ -1,0 +1,13 @@
+[fuzzer]
+max-iterations = 100000 # Example
+
+[executor]
+executor-type = "in-process"
+
+[executor.in-process-settings]
+harness-key = "rohcstar_decompressor"
+
+[corpus]
+corpus-type = "on-disk"
+on-disk-path = ".drifter_rohcstar_corpus"
+initial-seed-paths = ["rohcstar/fuzz/corpus/fuzz_decompressor_p1_umode/seed_ir_cid0.bin"]

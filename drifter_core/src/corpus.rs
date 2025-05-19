@@ -329,7 +329,7 @@ impl<I: Input + Serialize + for<'de> Deserialize<'de> + Encode + Decode<()>> Cor
         let mut count = 0;
         for path in seed_paths {
             if path.is_file() {
-                let input_obj: I = self.load_input_from_path(path)?;
+                let input_obj = self.load_input_from_path(path)?;
                 let meta_desc = format!("Initial Seed File: {:?}", path);
                 let on_disk_meta = OnDiskCorpusEntryMetadata {
                     source_description: meta_desc,
@@ -342,7 +342,7 @@ impl<I: Input + Serialize + for<'de> Deserialize<'de> + Encode + Decode<()>> Cor
                     let entry = entry?;
                     let file_path = entry.path();
                     if file_path.is_file() {
-                        let input_obj: I = self.load_input_from_path(&file_path)?;
+                        let input_obj = self.load_input_from_path(&file_path)?;
                         let meta_desc = format!("Initial Seed Dir: {:?}", file_path);
                         let on_disk_meta = OnDiskCorpusEntryMetadata {
                             source_description: meta_desc,

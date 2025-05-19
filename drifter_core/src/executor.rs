@@ -131,7 +131,7 @@ impl CommandExecutor {
                         }
                         return Err(ExecutionStatus::Timeout);
                     }
-                    std::thread::sleep(Duration::from_millis(50)); // Adjust poll interval
+                    std::thread::sleep(Duration::from_millis(50));
                 }
                 Err(e) => {
                     eprintln!("Error waiting for child process: {e}");
@@ -331,10 +331,10 @@ impl<I: Input> Executor<I> for CommandExecutor {
             }
         }
 
-        if !matches!(overall_status, ExecutionStatus::Crash(_)) && // Don't override Crash
-           !matches!(overall_status, ExecutionStatus::Timeout) &&   // Don't override Timeout
-           !matches!(overall_status, ExecutionStatus::ObserverError(_)) && // Don't override pre_exec ObserverError
-           post_exec_error_msg.is_some()
+        if !matches!(overall_status, ExecutionStatus::Crash(_))
+            && !matches!(overall_status, ExecutionStatus::Timeout)
+            && !matches!(overall_status, ExecutionStatus::ObserverError(_))
+            && post_exec_error_msg.is_some()
         {
             overall_status = ExecutionStatus::ObserverError(post_exec_error_msg.unwrap());
         }
