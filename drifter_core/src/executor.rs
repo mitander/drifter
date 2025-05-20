@@ -71,7 +71,11 @@ where
 
         let mut post_exec_error: Option<String> = None;
         for obs in observers.iter_mut() {
-            if let Err(e) = obs.post_exec(&execution_status, None::<&dyn Any>) {
+            if let Err(e) = obs.post_exec(
+                &execution_status,
+                None::<&dyn Any>,
+                Some(input as &dyn Input),
+            ) {
                 let error_msg = format!("Observer '{}' post_exec failed: {}", obs.name(), e);
                 eprintln!("ERROR: {error_msg}");
                 if post_exec_error.is_none() {
@@ -228,7 +232,9 @@ impl<I: Input> Executor<I> for CommandExecutor {
                 eprintln!("ERROR: {error_msg}");
                 let mut status_on_fail = ExecutionStatus::Other(error_msg.clone());
                 for obs in observers.iter_mut() {
-                    if let Err(e_obs) = obs.post_exec(&status_on_fail, None::<&dyn Any>) {
+                    if let Err(e_obs) =
+                        obs.post_exec(&status_on_fail, None::<&dyn Any>, Some(input as &dyn Input))
+                    {
                         eprintln!(
                             "ERROR during post_exec after spawn fail: Observer '{}' post_exec failed: {}",
                             obs.name(),
@@ -322,7 +328,11 @@ impl<I: Input> Executor<I> for CommandExecutor {
         let mut post_exec_error_msg: Option<String> = None;
 
         for obs in observers.iter_mut() {
-            if let Err(e) = obs.post_exec(&overall_status, Some(&process_output_data as &dyn Any)) {
+            if let Err(e) = obs.post_exec(
+                &overall_status,
+                Some(&process_output_data as &dyn Any),
+                Some(input as &dyn Input),
+            ) {
                 let error_msg = format!("Observer '{}' post_exec failed: {}", obs.name(), e);
                 eprintln!("ERROR: {error_msg}");
                 if post_exec_error_msg.is_none() {
@@ -403,6 +413,7 @@ mod in_process_executor_tests {
             &mut self,
             _status: &ExecutionStatus,
             _target_output: Option<&dyn Any>,
+            _input: Option<&dyn Input>,
         ) -> Result<(), anyhow::Error> {
             Ok(())
         }
@@ -412,12 +423,20 @@ mod in_process_executor_tests {
         fn serialize_data(&self) -> Option<Vec<u8>> {
             None
         }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
     }
 
     struct FailingPostExecObserver {
         should_fail_post: bool,
         fail_count: AtomicUsize,
     }
+
     impl Observer for FailingPostExecObserver {
         fn name(&self) -> &'static str {
             "FailingPostExecObserver"
@@ -429,6 +448,7 @@ mod in_process_executor_tests {
             &mut self,
             _status: &ExecutionStatus,
             _target_output: Option<&dyn Any>,
+            _input: Option<&dyn Input>,
         ) -> Result<(), anyhow::Error> {
             if self.should_fail_post {
                 self.fail_count.fetch_add(1, Ordering::SeqCst);
@@ -442,6 +462,12 @@ mod in_process_executor_tests {
         }
         fn serialize_data(&self) -> Option<Vec<u8>> {
             None
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
         }
     }
 

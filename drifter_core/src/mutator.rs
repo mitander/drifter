@@ -15,7 +15,7 @@ pub struct FlipSingleByteMutator;
 
 impl<I> Mutator<I> for FlipSingleByteMutator
 where
-    I: Input + From<Vec<u8>>,
+    I: Input + From<Vec<u8>> + Clone,
     Vec<u8>: From<I>,
 {
     fn mutate(
@@ -24,10 +24,11 @@ where
         rng: &mut dyn RngCore,
         _corpus_opt: Option<&dyn Corpus<I>>,
     ) -> Result<I, anyhow::Error> {
-        let mut bytes = match input_opt {
-            Some(inp) => Vec::from(inp.clone()),
-            None => vec![0u8; 1],
+        let concrete_input: I = match input_opt {
+            Some(input) => (*input).clone(),
+            None => I::from(vec![0u8; 1]),
         };
+        let mut bytes = Vec::from(concrete_input);
 
         if bytes.is_empty() {
             bytes.push(0);

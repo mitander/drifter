@@ -21,7 +21,10 @@ pub trait Oracle<I: Input>: Send + Sync {
 
 pub struct CrashOracle;
 
-impl<I: Input> Oracle<I> for CrashOracle {
+impl<I> Oracle<I> for CrashOracle
+where
+    I: Input + Clone,
+{
     fn examine(
         &self,
         input: &I,
@@ -30,7 +33,7 @@ impl<I: Input> Oracle<I> for CrashOracle {
     ) -> Option<BugReport<I>> {
         match status {
             ExecutionStatus::Crash(description) => Some(BugReport {
-                input: input.clone(),
+                input: (*input).clone(),
                 description: description.clone(),
                 hash: format!("{:x}", md5::compute(input.as_bytes())),
                 severity: 10,

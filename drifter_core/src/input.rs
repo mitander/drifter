@@ -1,4 +1,4 @@
-pub trait Input: Clone + Send + Sync + std::fmt::Debug + 'static {
+pub trait Input: Send + Sync + std::fmt::Debug + 'static {
     fn as_bytes(&self) -> &[u8];
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool;
