@@ -1,38 +1,81 @@
 use crate::input::Input;
 use crate::observer::Observer;
 use std::any::Any;
-use std::fs::File;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
-use tempfile;
+use tempfile::{self, NamedTempFile};
 
+/// Represents the status of a single execution of the target program or harness.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionStatus {
+    /// The target executed successfully without any detected issues.
     Ok,
+    /// The target execution exceeded the configured timeout.
     Timeout,
+    /// The target crashed or panicked during execution.
+    /// Contains a string describing the crash (e.g., panic message, signal).
     Crash(String),
+    /// An error occurred within an `Observer` during its `pre_exec` or `post_exec` hooks.
+    /// Contains a string describing the observer error.
     ObserverError(String),
+    /// Any other execution error not covered by the above categories (e.g., I/O error,
+    /// failure to spawn process). Contains a descriptive string.
     Other(String),
 }
 
+/// An `Executor` is responsible for running a target (either an in-process harness
+/// or an external command) with a given `Input` and managing `Observer` interactions.
+///
+/// # Type Parameters
+/// * `I`: The type of `Input` that this executor processes.
 pub trait Executor<I: Input> {
+    /// Executes the target synchronously with the provided `input`.
+    ///
+    /// This method handles the full lifecycle of a single execution:
+    /// 1. Calls `pre_exec` on all observers.
+    /// 2. Runs the target with the input.
+    /// 3. Captures the execution status (Ok, Crash, Timeout, etc.).
+    /// 4. Calls `post_exec` on all observers with the status and any target output.
+    ///
+    /// # Arguments
+    /// * `input`: A reference to the `Input` to be fed to the target.
+    /// * `observers`: A mutable slice of `Observer` trait objects that will monitor
+    ///   this execution. They are mutable to allow internal state changes.
+    ///
+    /// # Returns
+    /// The `ExecutionStatus` of the target's run.
     fn execute_sync(&mut self, input: &I, observers: &mut [&mut dyn Observer]) -> ExecutionStatus;
 }
 
+/// An `Executor` that runs a harness function directly within the fuzzer's process.
+///
+/// This is generally faster than `CommandExecutor` due to no process overhead, but it's less safe.
+/// If the harness function panics, it will typically crash the entire fuzzer process unless
+/// the panic is caught (as this executor attempts to do).
+///
+/// # Type Parameters
+/// * `F`: The type of the harness function. It must be a closure or function pointer
+///   that takes a `&[u8]` (the input bytes) and is `Send + Sync` to allow potential
+///   multi-threaded fuzzing in the future (though the executor itself is synchronous).
 pub struct InProcessExecutor<F>
 where
-    F: Fn(&[u8]),
+    F: Fn(&[u8]) + Send + Sync,
 {
     harness_fn: F,
 }
 
 impl<F> InProcessExecutor<F>
 where
-    F: Fn(&[u8]),
+    F: Fn(&[u8]) + Send + Sync,
 {
+    /// Creates a new `InProcessExecutor` with the given harness function.
+    ///
+    /// # Arguments
+    /// * `harness_fn`: The function to be executed with each input. It must take
+    ///   a byte slice (`&[u8]`) as input.
     pub fn new(harness_fn: F) -> Self {
         Self { harness_fn }
     }
@@ -43,77 +86,115 @@ where
     F: Fn(&[u8]) + Send + Sync,
 {
     fn execute_sync(&mut self, input: &I, observers: &mut [&mut dyn Observer]) -> ExecutionStatus {
+        // 1. Call pre_exec on all observers
         for obs in observers.iter_mut() {
             if let Err(e) = obs.pre_exec() {
                 let error_msg = format!("Observer '{}' pre_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {error_msg}");
+                eprintln!("ERROR: {}", error_msg);
                 return ExecutionStatus::ObserverError(error_msg);
             }
         }
 
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        // 2. Execute the harness function, catching panics
+        // AssertUnwindSafe is used because we are calling C or other FFI code
+        // (or Rust code that might panic) and want to catch the panic.
+        let execution_result = catch_unwind(AssertUnwindSafe(|| {
             (self.harness_fn)(input.as_bytes());
         }));
 
-        let mut execution_status = match result {
+        // Determine initial status based on panic or successful completion
+        let mut primary_status = match execution_result {
             Ok(_) => ExecutionStatus::Ok,
             Err(panic_payload) => {
-                let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                    s.clone()
+                // Try to extract a meaningful message from the panic payload
+                let panic_message = if let Some(s_ref) = panic_payload.downcast_ref::<&str>() {
+                    s_ref.to_string()
+                } else if let Some(s_obj) = panic_payload.downcast_ref::<String>() {
+                    s_obj.clone()
                 } else {
                     "Unknown panic type".to_string()
                 };
-                ExecutionStatus::Crash(msg)
+                ExecutionStatus::Crash(panic_message)
             }
         };
 
-        let mut post_exec_error: Option<String> = None;
+        // 3. Call post_exec on all observers
+        let mut post_exec_observer_error: Option<String> = None;
         for obs in observers.iter_mut() {
-            if let Err(e) = obs.post_exec(
-                &execution_status,
-                None::<&dyn Any>,
-                Some(input as &dyn Input),
-            ) {
+            // Pass None for target_output as InProcessExecutor doesn't capture stdout/stderr directly.
+            // Observers needing such data would typically instrument the harness or use other means.
+            if let Err(e) =
+                obs.post_exec(&primary_status, None::<&dyn Any>, Some(input as &dyn Input))
+            {
                 let error_msg = format!("Observer '{}' post_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {error_msg}");
-                if post_exec_error.is_none() {
-                    post_exec_error = Some(error_msg);
+                eprintln!("ERROR: {}", error_msg);
+                if post_exec_observer_error.is_none() {
+                    // Report the first observer error encountered during post_exec
+                    post_exec_observer_error = Some(error_msg);
                 }
             }
         }
 
-        if execution_status == ExecutionStatus::Ok && post_exec_error.is_some() {
-            execution_status = ExecutionStatus::ObserverError(post_exec_error.unwrap());
+        // 4. Finalize status: If execution was Ok but an observer failed in post_exec,
+        //    then the overall status becomes ObserverError. Crash status takes precedence.
+        if primary_status == ExecutionStatus::Ok {
+            if let Some(err_msg) = post_exec_observer_error {
+                primary_status = ExecutionStatus::ObserverError(err_msg);
+            }
+        } else if let ExecutionStatus::Crash(_) = primary_status {
+            if let Some(err_msg) = post_exec_observer_error {
+                eprintln!(
+                    "INFO: Observer error during post_exec after crash: {}",
+                    err_msg
+                );
+            }
         }
-        execution_status
+        primary_status
     }
 }
 
-pub enum InputDelivery {
+/// Specifies how input is delivered to a target executed by `CommandExecutor`.
+#[derive(Debug, Clone)]
+pub enum InputDeliveryMode {
+    /// Input is passed via standard input (stdin).
     StdIn,
+    /// Input is written to a temporary file, and the filename is passed as an argument.
+    /// The `String` contains the command-line argument template where `{}` is the placeholder
+    /// for the temporary filename. Example: `"--file={}"`
     File(String),
 }
 
+/// Configuration for a `CommandExecutor` instance.
+/// This is typically derived from `crate::config::CommandExecutorSettings`.
+#[derive(Debug, Clone)]
 pub struct CommandExecutorConfig {
-    pub command: Vec<String>,
-    pub input_delivery: InputDelivery,
-    pub timeout: Duration,
-    pub working_dir: Option<PathBuf>,
-    // pub envs: Option<Vec<(String, String)>>, // TODO: environment variables
+    /// The command and its arguments. First element is the executable.
+    pub command_with_args: Vec<String>,
+    /// How input is delivered to the target command.
+    pub input_delivery_mode: InputDeliveryMode,
+    /// Execution timeout for the target command.
+    pub execution_timeout: Duration,
+    /// Optional working directory for the command.
+    pub working_directory: Option<PathBuf>,
 }
 
+/// An `Executor` that runs the target as an external command-line program.
+///
+/// This provides better isolation than `InProcessExecutor`, as a crash in the target
+/// program does not directly crash the fuzzer. However, it incurs overhead due to
+/// process creation and inter-process communication (if any).
 pub struct CommandExecutor {
     config: CommandExecutorConfig,
-    // TODO: persistent state for the executor instance
 }
 
 impl CommandExecutor {
+    /// Creates a new `CommandExecutor` with the given runtime configuration.
     pub fn new(config: CommandExecutorConfig) -> Self {
         Self { config }
     }
 
+    /// Runs the spawned child process and waits for it to complete or timeout.
+    /// Handles killing the process if it times out.
     fn run_and_wait_with_timeout(
         &self,
         mut child: Child,
@@ -123,24 +204,39 @@ impl CommandExecutor {
 
         loop {
             match child.try_wait() {
-                Ok(Some(status)) => return Ok(status),
+                Ok(Some(status)) => return Ok(status), // Process exited
                 Ok(None) => {
-                    if start_time.elapsed() > timeout {
-                        eprintln!("Target timed out, killing...");
+                    if start_time.elapsed() >= timeout {
+                        eprintln!(
+                            "INFO: Target command timed out after {:?}. Killing process...",
+                            timeout
+                        );
                         if let Err(e) = child.kill() {
-                            eprintln!("Failed to kill child process: {e}");
+                            eprintln!("ERROR: Failed to kill timed-out child process: {}", e);
                             return Err(ExecutionStatus::Other(format!(
-                                "Failed to kill timed-out process: {e}",
+                                "Target timed out, and failed to kill process: {}",
+                                e
                             )));
                         }
-                        return Err(ExecutionStatus::Timeout);
+                        match child.wait() {
+                            Ok(_status) => return Err(ExecutionStatus::Timeout),
+                            Err(e) => {
+                                eprintln!("ERROR: Error waiting for killed child process: {}", e);
+                                return Err(ExecutionStatus::Other(format!(
+                                    "Target timed out, killed, but error during final wait: {}",
+                                    e
+                                )));
+                            }
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(50));
+                    // Minimal sleep to avoid busy-waiting excessively
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => {
-                    eprintln!("Error waiting for child process: {e}");
+                    eprintln!("ERROR: Error attempting to wait for child process: {}", e);
                     return Err(ExecutionStatus::Other(format!(
-                        "Error waiting for child: {e}",
+                        "Failed to wait for child process: {}",
+                        e
                     )));
                 }
             }
@@ -148,205 +244,218 @@ impl CommandExecutor {
     }
 }
 
-#[derive(Debug, Default)]
+/// Represents the collected output from an external process execution.
+/// This can be passed to observers via `post_exec`'s `target_output` argument.
+#[derive(Debug, Default, Clone)]
 pub struct ProcessOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+    /// Content of the target's standard output (stdout).
+    pub stdout_bytes: Vec<u8>,
+    /// Content of the target's standard error (stderr).
+    pub stderr_bytes: Vec<u8>,
+    /// The exit code of the process, if it exited normally.
     pub exit_code: Option<i32>,
-    pub signal: Option<i32>,
+    /// The signal number that terminated the process, if it was killed by a signal (Unix-specific).
+    pub signal_code: Option<i32>,
 }
 
 impl<I: Input> Executor<I> for CommandExecutor {
     fn execute_sync(&mut self, input: &I, observers: &mut [&mut dyn Observer]) -> ExecutionStatus {
+        // 1. Call pre_exec on all observers
         for obs in observers.iter_mut() {
             if let Err(e) = obs.pre_exec() {
                 let error_msg = format!("Observer '{}' pre_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {error_msg}");
+                eprintln!("ERROR: {}", error_msg);
                 return ExecutionStatus::ObserverError(error_msg);
             }
         }
 
-        let mut cmd = Command::new(&self.config.command[0]);
-        if self.config.command.len() > 1 {
-            cmd.args(&self.config.command[1..]);
+        // 2. Prepare the command
+        if self.config.command_with_args.is_empty() {
+            let err_msg = "Command executor configured with an empty command list.".to_string();
+            eprintln!("ERROR: {}", err_msg);
+            return ExecutionStatus::Other(err_msg);
+        }
+        let mut cmd = Command::new(&self.config.command_with_args[0]);
+        if self.config.command_with_args.len() > 1 {
+            cmd.args(&self.config.command_with_args[1..]);
         }
 
-        if let Some(cwd) = &self.config.working_dir {
+        if let Some(cwd) = &self.config.working_directory {
             cmd.current_dir(cwd);
         }
+        let mut temp_file_guard: Option<NamedTempFile> = None;
 
-        let mut temp_file_handle: Option<tempfile::NamedTempFile> = None;
-
-        match &self.config.input_delivery {
-            InputDelivery::StdIn => {
+        match &self.config.input_delivery_mode {
+            InputDeliveryMode::StdIn => {
                 cmd.stdin(Stdio::piped());
             }
-            InputDelivery::File(arg_template) => {
-                let named_temp_file = match tempfile::NamedTempFile::new() {
-                    Ok(f) => f,
+            InputDeliveryMode::File(arg_template_str) => {
+                match NamedTempFile::new() {
+                    Ok(mut temp_file) => {
+                        if let Err(e) = temp_file.write_all(input.as_bytes()) {
+                            let err_msg = format!(
+                                "Failed to write input to temporary file {:?}: {}",
+                                temp_file.path(),
+                                e
+                            );
+                            eprintln!("ERROR: {}", err_msg);
+                            return ExecutionStatus::Other(err_msg);
+                        }
+                        // Keep temp_file object alive until process finishes.
+                        // The path needs to be valid UTF-8 to be used in Command::arg.
+                        if let Some(path_str) = temp_file.path().to_str() {
+                            let final_arg = arg_template_str.replace("{}", path_str);
+                            // Args should be added one by one if the template might contain spaces
+                            // that are part of a single argument. For now, assuming simple replacement.
+                            // If complex arg structures are needed, the template itself should produce multiple args.
+                            cmd.arg(final_arg);
+                            temp_file_guard = Some(temp_file);
+                        } else {
+                            let err_msg = format!(
+                                "Temporary file path {:?} is not valid UTF-8",
+                                temp_file.path()
+                            );
+                            eprintln!("ERROR: {}", err_msg);
+                            return ExecutionStatus::Other(err_msg);
+                        }
+                    }
                     Err(e) => {
-                        return ExecutionStatus::Other(format!("Failed to create temp file: {e}",));
+                        let err_msg = format!("Failed to create temporary file for input: {}", e);
+                        eprintln!("ERROR: {}", err_msg);
+                        return ExecutionStatus::Other(err_msg);
                     }
-                };
-                if let Err(e) = File::create(named_temp_file.path())
-                    .and_then(|mut f| f.write_all(input.as_bytes()))
-                {
-                    return ExecutionStatus::Other(format!(
-                        "Failed to write to temp file {:?}: {}",
-                        named_temp_file.path(),
-                        e
-                    ));
                 }
-
-                let path_str = match named_temp_file.path().to_str() {
-                    Some(s) => s.to_string(),
-                    None => {
-                        return ExecutionStatus::Other(
-                            "Temp file path is not valid UTF-8".to_string(),
-                        );
-                    }
-                };
-
-                let final_arg = arg_template.replace("{}", &path_str);
-                // Split final_arg if it contains spaces and is meant to be multiple args
-                // For simplicity here, assume arg_template is like "--file={}" or "{}"
-                // If it's like "some_cmd {} --other-opt", then this split is naive.
-                // A more robust way would be to have the template produce a Vec<String>
-                // or have separate fields for prefix_args, input_arg_template, suffix_args.
-                // For now, just add it as one arg (or series of args if it contains spaces)
-                for part in final_arg.split_whitespace() {
-                    cmd.arg(part);
-                }
-                temp_file_handle = Some(named_temp_file);
             }
         }
 
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // 3. Spawn the child process
         let mut child_process = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
-                let error_msg =
-                    format!("Failed to spawn command '{:?}': {}", self.config.command, e);
-                eprintln!("ERROR: {error_msg}");
-                let mut status_on_fail = ExecutionStatus::Other(error_msg.clone());
-                for obs in observers.iter_mut() {
-                    if let Err(e_obs) =
-                        obs.post_exec(&status_on_fail, None::<&dyn Any>, Some(input as &dyn Input))
-                    {
+                let error_msg = format!(
+                    "Failed to spawn command '{:?}': {}",
+                    self.config.command_with_args, e
+                );
+                eprintln!("ERROR: {}", error_msg);
+                // Attempt to run post_exec for observers even on spawn failure
+                let status_on_fail = ExecutionStatus::Other(error_msg.clone());
+                for obs_on_fail in observers.iter_mut() {
+                    if let Err(e_obs) = obs_on_fail.post_exec(
+                        &status_on_fail,
+                        None::<&dyn Any>,
+                        Some(input as &dyn Input),
+                    ) {
                         eprintln!(
-                            "ERROR during post_exec after spawn fail: Observer '{}' post_exec failed: {}",
-                            obs.name(),
+                            "ERROR: Observer '{}' post_exec failed after spawn error: {}",
+                            obs_on_fail.name(),
                             e_obs
                         );
-                        // If post_exec fails, update the status to ObserverError if it wasn't already a more severe error
-                        if !matches!(status_on_fail, ExecutionStatus::ObserverError(_)) {
-                            status_on_fail = ExecutionStatus::ObserverError(format!(
-                                "Observer '{}' post_exec failed after spawn error: {}",
-                                obs.name(),
-                                e_obs
-                            ));
-                        }
                     }
                 }
                 return status_on_fail;
             }
         };
 
-        if let InputDelivery::StdIn = self.config.input_delivery {
+        // 4. Write to stdin if configured (after spawn, before wait)
+        if let InputDeliveryMode::StdIn = self.config.input_delivery_mode {
             if let Some(mut child_stdin) = child_process.stdin.take() {
                 if let Err(e) = child_stdin.write_all(input.as_bytes()) {
-                    eprintln!("Error writing to child stdin: {e}. Killing child.");
+                    eprintln!("ERROR: Error writing to child stdin: {}. Killing child.", e);
                     let _ = child_process.kill();
                     let _ = child_process.wait();
-                    return ExecutionStatus::Other(format!("Failed to write to stdin: {e}"));
+                    return ExecutionStatus::Other(format!(
+                        "Failed to write to target's stdin: {}",
+                        e
+                    ));
                 }
             } else {
+                let _ = child_process.kill();
+                let _ = child_process.wait();
                 return ExecutionStatus::Other(
                     "Child stdin was not available after piping.".to_string(),
                 );
             }
         }
 
-        // Wait for the child process with timeout
-        let exit_status_result = self.run_and_wait_with_timeout(child_process, self.config.timeout);
+        // 5. Wait for the child process with timeout (capturing stdout/stderr is tricky with this approach)
+        // A more robust method for capturing output with timeout involves `child.wait_with_output()`
+        // in a separate thread, or using crates like `subprocess` or `duct`.
+        let exit_status_result =
+            self.run_and_wait_with_timeout(child_process, self.config.execution_timeout);
 
-        // After run_and_wait_with_timeout, child_process has been consumed (waited on).
-        // To get stdout/stderr, we'd need to capture them from the child object before it's fully waited on,
-        // typically by spawning threads to read them or using non-blocking reads in the try_wait loop.
-        // For simplicity in this first pass, let's assume stdout/stderr are not captured here
-        // directly into ProcessOutput but could be read by specialized Observers if they interact
-        // with child.stdout/stderr handles (which would need to be managed carefully).
-        // A more robust solution uses `child.wait_with_output()` but that blocks and makes custom timeout harder.
-        //
-        // Let's refine `run_and_wait_with_timeout` or use a crate for process management that handles this better.
-        // For now, we'll just focus on the exit status. stdout/stderr capture will be more complex.
-        // We'll create a placeholder ProcessOutput for now.
-        let mut process_output_data = ProcessOutput::default();
+        let collected_process_output = ProcessOutput::default();
 
+        // Determine execution status based on exit_status_result
         let final_status = match exit_status_result {
             Ok(status) => {
-                process_output_data.exit_code = status.code();
+                let mut process_data_for_observer = ProcessOutput {
+                    exit_code: status.code(),
+                    ..Default::default()
+                };
+
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::ExitStatusExt;
-                    process_output_data.signal = status.signal();
+                    process_data_for_observer.signal_code = status.signal();
                 }
 
                 if status.success() {
                     ExecutionStatus::Ok
                 } else {
-                    let desc = if let Some(code) = status.code() {
-                        format!("Exited with code {code}")
-                    } else if cfg!(unix) {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::process::ExitStatusExt;
-                            if let Some(signal) = status.signal() {
-                                format!("Terminated by signal {signal}")
-                            } else {
-                                "Exited abnormally".to_string()
-                            }
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            "Exited abnormally".to_string()
-                        }
+                    let crash_desc = if let Some(code) = process_data_for_observer.exit_code {
+                        format!("Target exited with non-zero code: {}", code)
+                    } else if cfg!(unix) && process_data_for_observer.signal_code.is_some() {
+                        format!(
+                            "Target terminated by signal: {}",
+                            process_data_for_observer.signal_code.unwrap()
+                        )
                     } else {
-                        "Exited abnormally".to_string()
+                        "Target exited abnormally (unknown reason)".to_string()
                     };
-                    ExecutionStatus::Crash(desc)
+                    ExecutionStatus::Crash(crash_desc)
                 }
             }
-            Err(exec_status_from_wait) => exec_status_from_wait,
+            Err(status_from_wait_logic) => status_from_wait_logic,
         };
 
-        drop(temp_file_handle);
+        // Drop temp file if one was used
+        drop(temp_file_guard);
 
+        // 6. Call post_exec on all observers
         let mut overall_status = final_status;
-        let mut post_exec_error_msg: Option<String> = None;
+        let mut post_exec_observer_error_msg: Option<String> = None;
 
         for obs in observers.iter_mut() {
             if let Err(e) = obs.post_exec(
                 &overall_status,
-                Some(&process_output_data as &dyn Any),
+                Some(&collected_process_output as &dyn Any),
                 Some(input as &dyn Input),
             ) {
                 let error_msg = format!("Observer '{}' post_exec failed: {}", obs.name(), e);
-                eprintln!("ERROR: {error_msg}");
-                if post_exec_error_msg.is_none() {
-                    post_exec_error_msg = Some(error_msg);
+                eprintln!("ERROR: {}", error_msg);
+                if post_exec_observer_error_msg.is_none() {
+                    post_exec_observer_error_msg = Some(error_msg);
                 }
             }
         }
 
-        if !matches!(overall_status, ExecutionStatus::Crash(_))
-            && !matches!(overall_status, ExecutionStatus::Timeout)
+        // If the primary status was Ok, but an observer failed in post_exec,
+        // elevate the status to ObserverError.
+        // Critical statuses like Crash or Timeout take precedence over post_exec observer errors.
+        if overall_status == ExecutionStatus::Ok {
+            if let Some(observer_err_msg) = post_exec_observer_error_msg {
+                overall_status = ExecutionStatus::ObserverError(observer_err_msg);
+            }
+        } else if post_exec_observer_error_msg.is_some()
             && !matches!(overall_status, ExecutionStatus::ObserverError(_))
-            && post_exec_error_msg.is_some()
         {
-            overall_status = ExecutionStatus::ObserverError(post_exec_error_msg.unwrap());
+            eprintln!(
+                "INFO: Observer error during post_exec occurred with primary status: {:?}",
+                overall_status
+            );
         }
 
         overall_status
@@ -354,330 +463,532 @@ impl<I: Input> Executor<I> for CommandExecutor {
 }
 
 #[cfg(test)]
-mod in_process_executor_tests {
+mod tests {
     use super::*;
-    use crate::observer::{NoOpObserver, Observer};
-    use std::any::Any;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use crate::observer::{MockCoverageObserver, NoOpObserver, Observer};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    fn simple_harness(data: &[u8]) {
-        let _ = data;
-    }
+    #[cfg(test)]
+    mod in_process_executor_tests {
+        use super::*;
 
-    fn panicking_harness(data: &[u8]) {
-        if data.first() == Some(&0xFF) {
-            panic!("Boom!");
+        fn simple_ok_harness(_data: &[u8]) {
+            // No operation
         }
-    }
 
-    #[test]
-    fn in_process_executor_runs_harness() {
-        let mut executor = InProcessExecutor::new(simple_harness);
-        let input_data: Vec<u8> = vec![1, 2, 3];
-        let mut observer_instance = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer_instance];
-        let status = executor.execute_sync(&input_data, &mut observers);
-        assert_eq!(status, ExecutionStatus::Ok);
-    }
-
-    #[test]
-    fn in_process_executor_catches_panic() {
-        let mut executor = InProcessExecutor::new(panicking_harness);
-        let crashing_input: Vec<u8> = vec![0xFF];
-        let mut observer_instance = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer_instance];
-        let status = executor.execute_sync(&crashing_input, &mut observers);
-        match status {
-            ExecutionStatus::Crash(msg) => assert!(msg.contains("Boom!")),
-            _ => panic!("Expected a crash, got {status:?}"),
+        fn panicking_harness(data: &[u8]) {
+            if !data.is_empty() && data[0] == 0xFF {
+                panic!("Test panic triggered by input 0xFF!");
+            }
         }
-    }
 
-    struct FailingPreExecObserver {
-        should_fail_pre: bool,
-        fail_count: AtomicUsize,
-    }
-    impl Observer for FailingPreExecObserver {
-        fn name(&self) -> &'static str {
-            "FailingPreExecObserver"
+        #[derive(Default)]
+        struct TestObserverWithState {
+            pre_exec_called: AtomicBool,
+            post_exec_called: AtomicBool,
+            reset_called: AtomicBool,
+            input_byte_sum_on_post: AtomicUsize,
+            name: &'static str,
         }
-        fn pre_exec(&mut self) -> Result<(), anyhow::Error> {
-            if self.should_fail_pre {
-                self.fail_count.fetch_add(1, Ordering::SeqCst);
-                Err(anyhow::anyhow!("pre_exec intentional failure"))
-            } else {
+
+        impl TestObserverWithState {
+            fn new(name: &'static str) -> Self {
+                Self {
+                    name,
+                    ..Default::default()
+                }
+            }
+        }
+
+        impl Observer for TestObserverWithState {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn pre_exec(&mut self) -> Result<(), anyhow::Error> {
+                self.reset()?;
+                self.pre_exec_called.store(true, Ordering::SeqCst);
                 Ok(())
             }
-        }
-        fn post_exec(
-            &mut self,
-            _status: &ExecutionStatus,
-            _target_output: Option<&dyn Any>,
-            _input: Option<&dyn Input>,
-        ) -> Result<(), anyhow::Error> {
-            Ok(())
-        }
-        fn reset(&mut self) -> Result<(), anyhow::Error> {
-            Ok(())
-        }
-        fn serialize_data(&self) -> Option<Vec<u8>> {
-            None
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-    }
-
-    struct FailingPostExecObserver {
-        should_fail_post: bool,
-        fail_count: AtomicUsize,
-    }
-
-    impl Observer for FailingPostExecObserver {
-        fn name(&self) -> &'static str {
-            "FailingPostExecObserver"
-        }
-        fn pre_exec(&mut self) -> Result<(), anyhow::Error> {
-            Ok(())
-        }
-        fn post_exec(
-            &mut self,
-            _status: &ExecutionStatus,
-            _target_output: Option<&dyn Any>,
-            _input: Option<&dyn Input>,
-        ) -> Result<(), anyhow::Error> {
-            if self.should_fail_post {
-                self.fail_count.fetch_add(1, Ordering::SeqCst);
-                Err(anyhow::anyhow!("post_exec intentional failure"))
-            } else {
+            fn post_exec(
+                &mut self,
+                _s: &ExecutionStatus,
+                _to: Option<&dyn Any>,
+                i_opt: Option<&dyn Input>,
+            ) -> Result<(), anyhow::Error> {
+                self.post_exec_called.store(true, Ordering::SeqCst);
+                if let Some(inp) = i_opt {
+                    self.input_byte_sum_on_post.store(
+                        inp.as_bytes().iter().map(|&b| b as usize).sum(),
+                        Ordering::SeqCst,
+                    );
+                }
                 Ok(())
             }
-        }
-        fn reset(&mut self) -> Result<(), anyhow::Error> {
-            Ok(())
-        }
-        fn serialize_data(&self) -> Option<Vec<u8>> {
-            None
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-        fn as_any_mut(&mut self) -> &mut dyn Any {
-            self
-        }
-    }
-
-    #[test]
-    fn executor_handles_observer_pre_exec_failure() {
-        let mut executor = InProcessExecutor::new(simple_harness);
-        let input_data: Vec<u8> = vec![1];
-        let mut failing_observer = FailingPreExecObserver {
-            should_fail_pre: true,
-            fail_count: AtomicUsize::new(0),
-        };
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut failing_observer];
-
-        let status = executor.execute_sync(&input_data, &mut observers);
-        match status {
-            ExecutionStatus::ObserverError(msg) => {
-                assert!(msg.contains("pre_exec intentional failure"));
-                assert_eq!(failing_observer.fail_count.load(Ordering::SeqCst), 1);
+            fn reset(&mut self) -> Result<(), anyhow::Error> {
+                self.reset_called.store(true, Ordering::SeqCst);
+                self.post_exec_called.store(false, Ordering::SeqCst);
+                self.input_byte_sum_on_post.store(0, Ordering::SeqCst);
+                Ok(())
             }
-            _ => panic!("Expected ObserverError, got {status:?}"),
-        }
-    }
 
-    #[test]
-    fn executor_handles_observer_post_exec_failure() {
-        let mut executor = InProcessExecutor::new(simple_harness);
-        let input_data: Vec<u8> = vec![1];
-        let mut failing_observer = FailingPostExecObserver {
-            should_fail_post: true,
-            fail_count: AtomicUsize::new(0),
-        };
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut failing_observer];
-
-        let status = executor.execute_sync(&input_data, &mut observers);
-        match status {
-            ExecutionStatus::ObserverError(msg) => {
-                assert!(msg.contains("post_exec intentional failure"));
-                assert_eq!(failing_observer.fail_count.load(Ordering::SeqCst), 1);
+            fn serialize_data(&self) -> Option<Vec<u8>> {
+                None
             }
-            _ => panic!("Expected ObserverError, got {status:?}"),
-        }
-    }
-
-    #[test]
-    fn executor_reports_crash_even_if_post_exec_fails() {
-        let mut executor = InProcessExecutor::new(panicking_harness);
-        let crashing_input: Vec<u8> = vec![0xFF];
-        let mut failing_observer = FailingPostExecObserver {
-            should_fail_post: true,
-            fail_count: AtomicUsize::new(0),
-        };
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut failing_observer];
-
-        let status = executor.execute_sync(&crashing_input, &mut observers);
-        match status {
-            ExecutionStatus::Crash(msg) => {
-                assert!(msg.contains("Boom!"));
-                assert_eq!(failing_observer.fail_count.load(Ordering::SeqCst), 1);
+            fn as_any(&self) -> &dyn Any {
+                self
             }
-            _ => panic!("Expected Crash, got {status:?}"),
-        }
-    }
-}
-
-#[cfg(test)]
-mod command_executor_tests {
-    use super::*;
-    use crate::observer::NoOpObserver;
-
-    fn get_test_target_path(name: &str) -> PathBuf {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        manifest_dir.join("../test_targets").join(name)
-    }
-
-    #[test]
-    fn cmd_exec_successful_run_stdin() {
-        let target_path = get_test_target_path("test_target_ok.sh");
-        if !target_path.exists() {
-            panic!("Test target missing: {target_path:?}");
-        }
-
-        let config = CommandExecutorConfig {
-            command: vec![target_path.to_str().unwrap().to_string()],
-            input_delivery: InputDelivery::StdIn,
-            timeout: Duration::from_secs(1),
-            working_dir: None,
-        };
-        let mut executor = CommandExecutor::new(config);
-        let input_data: Vec<u8> = b"hello".to_vec();
-        let mut observer = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer];
-
-        let status = executor.execute_sync(&input_data, &mut observers);
-        assert_eq!(status, ExecutionStatus::Ok);
-    }
-
-    #[test]
-    fn cmd_exec_crash_detection() {
-        let target_path = get_test_target_path("test_target_crash.sh");
-        if !target_path.exists() {
-            panic!("Test target missing: {target_path:?}");
-        }
-
-        let config = CommandExecutorConfig {
-            command: vec![target_path.to_str().unwrap().to_string()],
-            input_delivery: InputDelivery::StdIn,
-            timeout: Duration::from_secs(1),
-            working_dir: None,
-        };
-        let mut executor = CommandExecutor::new(config);
-        let input_data: Vec<u8> = vec![];
-        let mut observer = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer];
-
-        let status = executor.execute_sync(&input_data, &mut observers);
-        match status {
-            ExecutionStatus::Crash(desc) => {
-                // On Unix, exit 139 means killed by signal 11 (SIGSEGV)
-                assert!(
-                    desc.contains("code 139") || desc.contains("signal 11"),
-                    "Unexpected crash desc: {desc}",
-                );
+            fn as_any_mut(&mut self) -> &mut dyn Any {
+                self
             }
-            _ => panic!("Expected Crash status, got {status:?}"),
-        }
-    }
-
-    #[test]
-    fn cmd_exec_timeout() {
-        let target_path = get_test_target_path("test_target_timeout.sh");
-        if !target_path.exists() {
-            panic!("Test target missing: {target_path:?}");
         }
 
-        let config = CommandExecutorConfig {
-            command: vec![target_path.to_str().unwrap().to_string()],
-            input_delivery: InputDelivery::StdIn,
-            timeout: Duration::from_millis(100), // test: 100ms, script: 5s
-            working_dir: None,
-        };
-        let mut executor = CommandExecutor::new(config);
-        let input_data: Vec<u8> = vec![];
-        let mut observer = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer];
+        #[test]
+        fn in_process_executor_runs_simple_harness_successfully() {
+            let mut executor = InProcessExecutor::new(simple_ok_harness);
+            let input_data: Vec<u8> = vec![1, 2, 3];
+            let mut observer = TestObserverWithState::new("obs1");
 
-        let status = executor.execute_sync(&input_data, &mut observers);
-        assert_eq!(status, ExecutionStatus::Timeout);
-    }
+            assert!(!observer.pre_exec_called.load(Ordering::Relaxed));
+            assert!(!observer.reset_called.load(Ordering::Relaxed));
 
-    #[test]
-    fn cmd_exec_input_via_file() {
-        let target_path = get_test_target_path("test_target_file_check.sh");
-        if !target_path.exists() {
-            panic!("Test target missing: {target_path:?}");
+            let mut observers_list: [&mut dyn Observer; 1] = [&mut observer];
+            let status = executor.execute_sync(&input_data, &mut observers_list);
+
+            assert_eq!(status, ExecutionStatus::Ok);
+            assert!(
+                observer.pre_exec_called.load(Ordering::SeqCst),
+                "Observer pre_exec_called should be true after execution"
+            );
+            assert!(observer.post_exec_called.load(Ordering::SeqCst));
+            assert!(
+                observer.reset_called.load(Ordering::SeqCst),
+                "Observer reset_called_flag (from pre_exec) should be true"
+            );
+            assert_eq!(observer.input_byte_sum_on_post.load(Ordering::SeqCst), 6);
         }
 
-        let config = CommandExecutorConfig {
-            command: vec![target_path.to_str().unwrap().to_string()],
-            input_delivery: InputDelivery::File("{}".to_string()),
-            timeout: Duration::from_secs(1),
-            working_dir: None,
-        };
-        let mut executor = CommandExecutor::new(config);
+        #[test]
+        fn in_process_executor_catches_harness_panic() {
+            let mut executor = InProcessExecutor::new(panicking_harness);
+            let mut observer = NoOpObserver;
+            let mut observers_list: [&mut dyn Observer; 1] = [&mut observer];
 
-        let input_ok: Vec<u8> = b"OK_FILE".to_vec();
-        let input_crash: Vec<u8> = b"CRASHFILE".to_vec();
-        let mut observer = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer];
+            let crashing_input: Vec<u8> = vec![0xFF, 0xAA, 0xBB]; // Starts with 0xFF
+            let status = executor.execute_sync(&crashing_input, &mut observers_list);
 
-        let status_ok = executor.execute_sync(&input_ok, &mut observers);
-        assert_eq!(
-            status_ok,
-            ExecutionStatus::Ok,
-            "Expected Ok for non-crashing file input"
-        );
-
-        let status_crash = executor.execute_sync(&input_crash, &mut observers);
-        match status_crash {
-            ExecutionStatus::Crash(desc) => {
-                assert!(
-                    desc.contains("code 1"),
-                    "Expected crash with code 1, got: {desc}",
-                );
+            match status {
+                ExecutionStatus::Crash(msg) => {
+                    assert!(
+                        msg.contains("Test panic triggered by input 0xFF!"),
+                        "Crash message mismatch. Got: {}",
+                        msg
+                    );
+                }
+                _ => panic!("Expected ExecutionStatus::Crash, got {:?}", status),
             }
-            _ => panic!("Expected Crash status for CRASHFILE, got {status_crash:?}",),
+        }
+
+        #[test]
+        fn in_process_executor_handles_observer_pre_exec_failure() {
+            struct FailingPreObserver;
+            impl Observer for FailingPreObserver {
+                fn name(&self) -> &'static str {
+                    "FailingPre"
+                }
+                fn pre_exec(&mut self) -> Result<(), anyhow::Error> {
+                    Err(anyhow::anyhow!("pre_exec failed"))
+                }
+                fn post_exec(
+                    &mut self,
+                    _: &ExecutionStatus,
+                    _: Option<&dyn Any>,
+                    _: Option<&dyn Input>,
+                ) -> Result<(), anyhow::Error> {
+                    Ok(())
+                }
+                fn reset(&mut self) -> Result<(), anyhow::Error> {
+                    Ok(())
+                }
+                fn serialize_data(&self) -> Option<Vec<u8>> {
+                    None
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+                fn as_any_mut(&mut self) -> &mut dyn Any {
+                    self
+                }
+            }
+            let mut executor = InProcessExecutor::new(simple_ok_harness);
+            let input_data: Vec<u8> = vec![1];
+            let mut failing_observer = FailingPreObserver;
+            let mut observers: [&mut dyn Observer; 1] = [&mut failing_observer];
+
+            let status = executor.execute_sync(&input_data, &mut observers);
+            match status {
+                ExecutionStatus::ObserverError(msg) => assert!(msg.contains("pre_exec failed")),
+                _ => panic!("Expected ObserverError, got {:?}", status),
+            }
+        }
+
+        #[test]
+        fn in_process_executor_handles_observer_post_exec_failure_when_harness_ok() {
+            struct FailingPostObserver {
+                post_exec_called_count: usize,
+            }
+            impl Observer for FailingPostObserver {
+                fn name(&self) -> &'static str {
+                    "FailingPost"
+                }
+                fn pre_exec(&mut self) -> Result<(), anyhow::Error> {
+                    Ok(())
+                }
+                fn post_exec(
+                    &mut self,
+                    _: &ExecutionStatus,
+                    _: Option<&dyn Any>,
+                    _: Option<&dyn Input>,
+                ) -> Result<(), anyhow::Error> {
+                    self.post_exec_called_count += 1;
+                    Err(anyhow::anyhow!("post_exec failed"))
+                }
+                fn reset(&mut self) -> Result<(), anyhow::Error> {
+                    Ok(())
+                }
+                fn serialize_data(&self) -> Option<Vec<u8>> {
+                    None
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+                fn as_any_mut(&mut self) -> &mut dyn Any {
+                    self
+                }
+            }
+            let mut executor = InProcessExecutor::new(simple_ok_harness);
+            let input_data: Vec<u8> = vec![1];
+            let mut failing_observer = FailingPostObserver {
+                post_exec_called_count: 0,
+            };
+            let mut observers: [&mut dyn Observer; 1] = [&mut failing_observer];
+
+            let status = executor.execute_sync(&input_data, &mut observers);
+            match status {
+                ExecutionStatus::ObserverError(msg) => {
+                    assert!(msg.contains("post_exec failed"));
+                    assert_eq!(
+                        failing_observer.post_exec_called_count, 1,
+                        "post_exec should have been called once"
+                    );
+                }
+                _ => panic!(
+                    "Expected ObserverError for post_exec failure, got {:?}",
+                    status
+                ),
+            }
+        }
+
+        #[test]
+        fn in_process_executor_reports_crash_even_if_post_exec_fails() {
+            struct FailingPostObserver {
+                post_exec_called_count: usize,
+            }
+            impl Observer for FailingPostObserver {
+                fn name(&self) -> &'static str {
+                    "FailingPostAfterCrash"
+                }
+                fn pre_exec(&mut self) -> Result<(), anyhow::Error> {
+                    Ok(())
+                }
+                fn post_exec(
+                    &mut self,
+                    status: &ExecutionStatus,
+                    _: Option<&dyn Any>,
+                    _: Option<&dyn Input>,
+                ) -> Result<(), anyhow::Error> {
+                    self.post_exec_called_count += 1;
+                    assert!(
+                        matches!(status, ExecutionStatus::Crash(_)),
+                        "Observer should see Crash status in post_exec"
+                    );
+                    Err(anyhow::anyhow!("post_exec failed after crash"))
+                }
+                fn reset(&mut self) -> Result<(), anyhow::Error> {
+                    Ok(())
+                }
+                fn serialize_data(&self) -> Option<Vec<u8>> {
+                    None
+                }
+                fn as_any(&self) -> &dyn Any {
+                    self
+                }
+                fn as_any_mut(&mut self) -> &mut dyn Any {
+                    self
+                }
+            }
+            let mut executor = InProcessExecutor::new(panicking_harness);
+            let mut failing_observer = FailingPostObserver {
+                post_exec_called_count: 0,
+            };
+            let mut observers: [&mut dyn Observer; 1] = [&mut failing_observer];
+            let crashing_input: Vec<u8> = vec![0xFF]; // Triggers panic
+
+            let status = executor.execute_sync(&crashing_input, &mut observers);
+            match status {
+                ExecutionStatus::Crash(msg) => {
+                    assert!(msg.contains("Test panic triggered"));
+                    assert_eq!(
+                        failing_observer.post_exec_called_count, 1,
+                        "post_exec should have been called once, even after crash"
+                    );
+                }
+                _ => panic!(
+                    "Expected Crash status, even with post_exec failure, got {:?}",
+                    status
+                ),
+            }
         }
     }
 
-    #[test]
-    fn cmd_exec_invalid_command() {
-        let config = CommandExecutorConfig {
-            command: vec!["./this_command_does_not_exist_ever_12345.sh".to_string()],
-            input_delivery: InputDelivery::StdIn,
-            timeout: Duration::from_secs(1),
-            working_dir: None,
-        };
-        let mut executor = CommandExecutor::new(config);
-        let input_data: Vec<u8> = vec![];
-        let mut observer = NoOpObserver;
-        let mut observers: Vec<&mut dyn Observer> = vec![&mut observer];
+    #[cfg(test)]
+    mod command_executor_tests {
+        use super::*;
+        use std::env;
 
-        let status = executor.execute_sync(&input_data, &mut observers);
-        match status {
-            ExecutionStatus::Other(msg) => {
-                assert!(
-                    msg.contains("Failed to spawn command")
-                        || msg.contains("No such file or directory")
-                );
+        // Helper to get path to test_targets
+        fn get_test_target_path(target_name: &str) -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../test_targets")
+                .join(target_name)
+        }
+
+        #[test]
+        fn cmd_exec_successful_run_with_stdin_delivery() {
+            let target_path = get_test_target_path("test_target_ok.sh");
+            if !target_path.exists() {
+                panic!("Test target script missing: {:?}", target_path);
             }
-            _ => panic!("Expected Other status for invalid command, got {status:?}",),
+
+            let config = CommandExecutorConfig {
+                command_with_args: vec![target_path.to_string_lossy().into_owned()],
+                input_delivery_mode: InputDeliveryMode::StdIn,
+                execution_timeout: Duration::from_secs(2),
+                working_directory: None,
+            };
+            let mut executor = CommandExecutor::new(config);
+            let input_data: Vec<u8> = b"hello_stdin".to_vec();
+            let mut no_op_observer = NoOpObserver;
+            let mut observers: [&mut dyn Observer; 1] = [&mut no_op_observer];
+
+            let status = executor.execute_sync(&input_data, &mut observers);
+            assert_eq!(status, ExecutionStatus::Ok, "Expected successful execution");
+        }
+
+        #[test]
+        fn cmd_exec_detects_crash_exit_code() {
+            let target_path = get_test_target_path("test_target_exit_code_crash.sh");
+            if !target_path.exists() {
+                panic!("Test script missing: {:?}", target_path);
+            }
+            let config = CommandExecutorConfig {
+                command_with_args: vec![
+                    target_path.to_string_lossy().into_owned(),
+                    "77".to_string(),
+                ], // Script expects arg for exit code
+                input_delivery_mode: InputDeliveryMode::StdIn,
+                execution_timeout: Duration::from_secs(1),
+                working_directory: None,
+            };
+            let mut executor = CommandExecutor::new(config);
+            let mut obs = NoOpObserver;
+            let mut observers: [&mut dyn Observer; 1] = [&mut obs];
+            let status = executor.execute_sync(&Vec::new(), &mut observers);
+            match status {
+                // Ensure the script actually exits with 77 after permissions are fixed
+                ExecutionStatus::Crash(desc) => assert!(
+                    desc.contains("exited with non-zero code: 77"),
+                    "Description was: {}",
+                    desc
+                ),
+                _ => panic!("Expected Crash with code 77, got {:?}", status),
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn cmd_exec_detects_crash_by_signal() {
+            let target_path = get_test_target_path("test_target_signal_crash.sh");
+            if !target_path.exists() {
+                panic!("Test script missing: {:?}", target_path);
+            }
+            let config = CommandExecutorConfig {
+                command_with_args: vec![target_path.to_string_lossy().into_owned()],
+                input_delivery_mode: InputDeliveryMode::StdIn,
+                execution_timeout: Duration::from_secs(2),
+                working_directory: None,
+            };
+            let mut executor = CommandExecutor::new(config);
+            let mut obs = NoOpObserver;
+            let mut observers: [&mut dyn Observer; 1] = [&mut obs];
+            let status = executor.execute_sync(&Vec::new(), &mut observers);
+            match status {
+                ExecutionStatus::Crash(desc) => {
+                    // Be a bit flexible with signal description, as it can vary slightly
+                    // SIGSEGV is 11, SIGABRT is 6.
+                    let sigsegv = desc.contains("signal: 11") || desc.contains("Signal 11");
+                    let sigabrt = desc.contains("signal: 6") || desc.contains("Signal 6");
+                    assert!(
+                        sigsegv || sigabrt,
+                        "Expected crash by SIGSEGV (11) or SIGABRT (6). Got: {}",
+                        desc
+                    );
+                }
+                _ => panic!("Expected Crash by signal, got {:?}", status),
+            }
+        }
+        #[test]
+        fn cmd_exec_handles_timeout_correctly() {
+            // This script sleeps for 5 seconds
+            let target_path = get_test_target_path("test_target_timeout.sh");
+            if !target_path.exists() {
+                panic!("Test target script missing: {:?}", target_path);
+            }
+
+            let config = CommandExecutorConfig {
+                command_with_args: vec![target_path.to_string_lossy().into_owned()],
+                input_delivery_mode: InputDeliveryMode::StdIn,
+                execution_timeout: Duration::from_millis(100), // But we timeout after 200ms
+                working_directory: None,
+            };
+            let mut executor = CommandExecutor::new(config);
+            let input_data: Vec<u8> = Vec::new();
+            let mut no_op_observer = NoOpObserver;
+            let mut observers: [&mut dyn Observer; 1] = [&mut no_op_observer];
+
+            let status = executor.execute_sync(&input_data, &mut observers);
+            assert_eq!(
+                status,
+                ExecutionStatus::Timeout,
+                "Expected execution to time out"
+            );
+        }
+
+        #[test]
+        fn cmd_exec_input_delivery_via_file() {
+            let target_path = get_test_target_path("test_target_reads_file.sh");
+            if !target_path.exists() {
+                panic!("Test target script missing: {:?}", target_path);
+            }
+
+            let config = CommandExecutorConfig {
+                command_with_args: vec![target_path.to_string_lossy().into_owned()],
+                input_delivery_mode: InputDeliveryMode::File("{}".to_string()),
+                execution_timeout: Duration::from_secs(1),
+                working_directory: None,
+            };
+
+            let mut executor = CommandExecutor::new(config);
+            let mut mock_obs_instance = MockCoverageObserver::new();
+            let mut observers_list_for_exec: [&mut dyn Observer; 1] = [&mut mock_obs_instance];
+
+            // Test 1: Expected to succeed
+            let input_ok_content: Vec<u8> = b"EXPECTED_CONTENT_OK".to_vec();
+            let status_ok = executor.execute_sync(&input_ok_content, &mut observers_list_for_exec);
+
+            assert_eq!(
+                status_ok,
+                ExecutionStatus::Ok,
+                "Expected Ok for correct file content"
+            );
+
+            let observer_trait_obj_ok: &mut dyn Observer = observers_list_for_exec[0];
+
+            if status_ok == ExecutionStatus::Ok {
+                match observer_trait_obj_ok.serialize_data() {
+                    Some(observed_hash_data) => {
+                        assert_eq!(
+                            observed_hash_data,
+                            md5::compute(input_ok_content.as_bytes()).0.to_vec(),
+                            "Observed hash for OK case does not match input hash"
+                        );
+                    }
+                    None => {
+                        panic!(
+                            "MockCoverageObserver (via slice) did not serialize data after successful OK execution. Hash was None."
+                        );
+                    }
+                }
+            }
+
+            // Test 2: Expected to "crash" (exit with code 1)
+            let input_fail_content: Vec<u8> = b"UNEXPECTED_FAIL_CONTENT".to_vec();
+
+            observers_list_for_exec[0]
+                .reset()
+                .expect("Observer reset failed");
+
+            let status_fail =
+                executor.execute_sync(&input_fail_content, &mut observers_list_for_exec);
+            match status_fail {
+                ExecutionStatus::Crash(desc) => {
+                    assert!(
+                        desc.contains("exited with non-zero code: 1"),
+                        "Expected script to exit 1 for wrong content, got: {}",
+                        desc
+                    );
+                }
+                _ => panic!(
+                    "Expected Crash status for incorrect file content, got {:?}",
+                    status_fail
+                ),
+            }
+
+            let observer_trait_obj_fail: &mut dyn Observer = observers_list_for_exec[0];
+
+            match observer_trait_obj_fail.serialize_data() {
+                Some(observed_hash_data_fail) => {
+                    assert_eq!(
+                        observed_hash_data_fail,
+                        md5::compute(input_fail_content.as_bytes()).0.to_vec(),
+                        "Observed hash for FAIL case does not match input hash"
+                    );
+                }
+                None => {
+                    panic!(
+                        "MockCoverageObserver (via slice) did not serialize data after FAIL execution. Hash was None."
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn cmd_exec_handles_invalid_command_path() {
+            let config = CommandExecutorConfig {
+                command_with_args: vec!["./this_command_does_not_exist_ever_12345.sh".to_string()],
+                input_delivery_mode: InputDeliveryMode::StdIn,
+                execution_timeout: Duration::from_secs(1),
+                working_directory: None,
+            };
+            let mut executor = CommandExecutor::new(config);
+            let input_data: Vec<u8> = Vec::new();
+            let mut no_op_observer = NoOpObserver;
+            let mut observers: [&mut dyn Observer; 1] = [&mut no_op_observer];
+
+            let status = executor.execute_sync(&input_data, &mut observers);
+            match status {
+                ExecutionStatus::Other(msg) => {
+                    assert!(
+                        msg.contains("Failed to spawn command"),
+                        "Error message should indicate spawn failure. Got: {}",
+                        msg
+                    );
+                    // Underlying OS error might be "No such file or directory" or similar.
+                }
+                _ => panic!(
+                    "Expected Other status for invalid command, got {:?}",
+                    status
+                ),
+            }
         }
     }
 }
