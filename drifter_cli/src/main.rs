@@ -95,7 +95,7 @@ fn main() -> Result<(), anyhow::Error> {
     println!("Effective configuration: {:#?}", config);
 
     let mut rng = ChaCha8Rng::from_seed([0u8; 32]);
-    let mut mutator: Box<dyn Mutator<Vec<u8>>> = Box::new(FlipSingleByteMutator);
+    let mut mutator: Box<dyn Mutator<Vec<u8>, ChaCha8Rng>> = Box::new(FlipSingleByteMutator);
     let oracle: Box<dyn Oracle<Vec<u8>>> = Box::new(CrashOracle);
 
     let mut executor: Box<dyn Executor<Vec<u8>>> = match config.executor.executor_type {
