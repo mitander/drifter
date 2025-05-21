@@ -14,7 +14,7 @@ use drifter_core::oracle::{CrashOracle, Oracle};
 use drifter_core::scheduler::{RandomScheduler, Scheduler, SchedulerError};
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
-use rohcstar::fuzz_harnesses::rohc_decompressor_harness;
+use rohcstar::fuzz_harnesses::rohc_profile1_umode_decompressor_harness;
 use std::any::Any;
 use std::collections::HashMap;
 use std::io::Write as StdIoWrite;
@@ -127,7 +127,7 @@ fn main() -> Result<(), anyhow::Error> {
             let harness_fn_to_run: fn(&[u8]) = match settings.harness_key.as_str() {
                 "rohcstar_decompressor" => {
                     println!("INFO: Using Rohcstar decompressor in-process harness.");
-                    rohc_decompressor_harness
+                    rohc_profile1_umode_decompressor_harness
                 }
                 "" | "default_dummy" => {
                     println!("INFO: Using default_dummy in-process harness.");
